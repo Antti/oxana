@@ -209,7 +209,8 @@ where
                 .finish_with_success_batch(envelopes)
                 .await
             {
-                tracing::error!("Failed to finish job batch: {}", e);
+                // A live heartbeat would prevent recovery of an unacknowledged claim.
+                config.fail(e);
             }
             WorkerResultKind::Success
         }

@@ -191,13 +191,17 @@ async fn read_frame(stream: &mut BufReader<TcpStream>) -> io::Result<Vec<u8>> {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
         remaining -= 1;
-        match frame[start] {
+        let prefix = *frame.get(start).ok_or(io::ErrorKind::UnexpectedEof)?;
+        match prefix {
             b'*' | b'$' => {
-                let length: i64 = std::str::from_utf8(&frame[start + 1..frame.len() - 2])
+                let digits = frame
+                    .get(start + 1..frame.len().saturating_sub(2))
+                    .ok_or(io::ErrorKind::InvalidData)?;
+                let length: i64 = std::str::from_utf8(digits)
                     .map_err(io::Error::other)?
                     .parse()
                     .map_err(io::Error::other)?;
-                if frame[start] == b'*' {
+                if prefix == b'*' {
                     remaining += length.max(0);
                 } else if length >= 0 {
                     let start = frame.len();
@@ -205,7 +209,8 @@ async fn read_frame(stream: &mut BufReader<TcpStream>) -> io::Result<Vec<u8>> {
                         start + usize::try_from(length).map_err(io::Error::other)? + 2,
                         0,
                     );
-                    stream.read_exact(&mut frame[start..]).await?;
+                    let body = frame.get_mut(start..).ok_or(io::ErrorKind::UnexpectedEof)?;
+                    stream.read_exact(body).await?;
                 }
             }
             b'+' | b'-' | b':' => {}

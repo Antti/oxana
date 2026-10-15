@@ -622,3 +622,70 @@ async fn failed_handoff_retains_recoverable_work_before_or_after_commit() -> Tes
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn acknowledgment_failure_stops_runtime_and_recovers_only_uncommitted_work() -> TestResult {
+    for committed in [false, true] {
+        let pool = setup();
+        let namespace = random_string();
+        let queue = random_string();
+        let storage = Storage::builder()
+            .namespace(&namespace)
+            .build_from_pool(pool.clone())?;
+        let id = storage
+            .enqueue(RecoveryQueue(queue.clone()), RecoveryJob { block: false })
+            .await?;
+        let script =
+            deadpool_redis::redis::Script::new(include_str!("../../src/finish_success.lua"));
+        let prefix = vec![
+            "EVALSHA".into(),
+            script.get_hash().into(),
+            "2".into(),
+            format!("{namespace}:jobs"),
+        ];
+        let proxy = if committed {
+            RedisProxy::start(prefix, true).await?
+        } else {
+            RedisProxy::reject_once(prefix).await?
+        };
+        let runtime_storage = Storage::builder()
+            .namespace(&namespace)
+            .build_from_pool(proxy.pool.clone())?;
+        let state = Arc::new(State::default());
+        let queue_config = QueueConfig::as_static(&queue).concurrency(1);
+        let result = tokio::time::timeout(
+            WAIT,
+            runtime_storage
+                .runtime(Arc::clone(&state))
+                .queue_with(queue_config.clone())
+                .worker::<RecoveryWorker, RecoveryJob>()
+                .dequeue_timeout(Duration::from_millis(10))
+                .run(),
+        )
+        .await?;
+        assert!(proxy.injected());
+        assert!(
+            result.is_err(),
+            "unacknowledged claims must not retain a live heartbeat"
+        );
+        assert_eq!(*state.executed.lock().await, vec![id.clone()]);
+        if !committed {
+            assert!(storage.get_job(&id).await?.is_some());
+            assert_eq!(
+                run_replacement(&storage, queue_config, Arc::clone(&state))
+                    .await?
+                    .succeeded,
+                1
+            );
+            assert_eq!(*state.executed.lock().await, vec![id.clone(), id.clone()]);
+        }
+        assert!(storage.get_job(&id).await?.is_none());
+        assert_eq!(storage.enqueued_count(RecoveryQueue(queue)).await?, 0);
+        let mut redis = pool.get().await?;
+        let keys: Vec<String> = redis.keys(format!("{namespace}:processing:*")).await?;
+        for key in keys {
+            assert_eq!(redis.llen::<_, usize>(key).await?, 0);
+        }
+    }
+    Ok(())
+}
