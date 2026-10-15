@@ -103,3 +103,46 @@ pub async fn test_dead_uses_custom_error_formatter() -> TestResult {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn dead_retention_can_preserve_more_than_one_thousand_payloads() -> TestResult {
+    for (limit, expected) in [(None, 1001), (std::num::NonZeroUsize::new(2), 2)] {
+        let storage = oxana::Storage::builder()
+            .namespace(random_string())
+            .dead_job_limit(limit)
+            .build_from_pool(setup())?;
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..1001 {
+            ids.insert(storage.enqueue(QueueOne, WorkerFailJob {}).await?);
+        }
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            storage
+                .runtime(())
+                .queue_with_concurrency::<QueueOne>(20)
+                .worker::<WorkerFail, WorkerFailJob>()
+                .dequeue_timeout(std::time::Duration::from_millis(10))
+                .exit_when_processed(1001)
+                .run(),
+        )
+        .await??;
+        assert_eq!(stats.failed, 1001);
+        let dead = storage
+            .list_dead(&oxana::QueueListOpts {
+                count: 1001,
+                offset: 0,
+            })
+            .await?;
+        assert_eq!(dead.len(), expected);
+        if limit.is_none() {
+            assert_eq!(
+                dead.into_iter()
+                    .map(|job| job.id)
+                    .collect::<std::collections::HashSet<_>>(),
+                ids
+            );
+        }
+        assert_eq!(storage.jobs_count().await?, 0);
+    }
+    Ok(())
+}

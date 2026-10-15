@@ -155,7 +155,6 @@ where
         }
         Err(e) => {
             tracing::error!("Job failed: {}", e);
-            storage.internal.finish_with_failure(&envelope).await?;
             storage
                 .internal
                 .kill(&envelope, settings.format_error(e.as_ref()))

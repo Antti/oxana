@@ -69,6 +69,7 @@ pub(crate) struct StorageInternal {
     started_at: i64,
     instance_id: String,
     consecutive_redis_failures: Arc<AtomicU32>,
+    dead_job_limit: Option<usize>,
 }
 
 enum JobEnqueueAction {
@@ -90,6 +91,11 @@ struct QueueStatsInputs {
 }
 
 impl StorageInternal {
+    pub(crate) fn with_dead_job_limit(mut self, limit: Option<usize>) -> Self {
+        self.dead_job_limit = limit;
+        self
+    }
+
     pub fn new(pool: deadpool_redis::Pool, namespace: Option<String>) -> Self {
         Self::with_optional_stats_pool(pool, None, namespace)
     }
@@ -115,6 +121,7 @@ impl StorageInternal {
             started_at: chrono::Utc::now().timestamp(),
             instance_id: uuid::Uuid::new_v4().simple().to_string(),
             consecutive_redis_failures: Arc::new(AtomicU32::new(0)),
+            dead_job_limit: Some(1000),
         }
     }
 
@@ -581,18 +588,17 @@ impl StorageInternal {
         let now = chrono::Utc::now().timestamp_micros() as u64;
 
         let mut redis = self.connection().await?;
-        let _: () = redis::pipe()
-            .hset(
-                &self.keys.jobs,
-                &updated_envelope.id,
-                serde_json::to_string(&updated_envelope)?,
-            )
-            .zadd(
-                &self.keys.retry,
-                updated_envelope.id,
-                now + delay_s * 1_000_000,
-            )
-            .query_async(&mut redis)
+        // Release ownership only after the payload and retry destination are durable.
+        static RETRY: std::sync::LazyLock<redis::Script> =
+            std::sync::LazyLock::new(|| redis::Script::new(include_str!("retry_failed.lua")));
+        let _: () = RETRY
+            .key(&self.keys.jobs)
+            .key(&self.keys.retry)
+            .key(self.current_processing_queue())
+            .arg(&updated_envelope.id)
+            .arg(serde_json::to_string(&updated_envelope)?)
+            .arg(now + delay_s * 1_000_000)
+            .invoke_async(&mut *redis)
             .await?;
         Ok(())
     }
@@ -793,12 +799,16 @@ impl StorageInternal {
     pub async fn kill(&self, envelope: &JobEnvelope, error: String) -> Result<(), OxanaError> {
         let envelope = envelope.clone().with_error(error);
         let mut redis = self.connection().await?;
-        let _: () = redis::pipe()
-            .lrem(self.current_processing_queue(), 1, &envelope.id)
-            .hdel(&self.keys.jobs, &envelope.id)
-            .lpush(&self.keys.dead, &serde_json::to_string(&envelope)?)
-            .ltrim(&self.keys.dead, 0, 999)
-            .query_async(&mut redis)
+        static KILL: std::sync::LazyLock<redis::Script> =
+            std::sync::LazyLock::new(|| redis::Script::new(include_str!("finish_dead.lua")));
+        let _: () = KILL
+            .key(&self.keys.jobs)
+            .key(&self.keys.dead)
+            .key(self.current_processing_queue())
+            .arg(&envelope.id)
+            .arg(serde_json::to_string(&envelope)?)
+            .arg(self.dead_job_limit.unwrap_or(0))
+            .invoke_async(&mut *redis)
             .await?;
         Ok(())
     }
@@ -834,15 +844,6 @@ impl StorageInternal {
 
         let mut redis = self.connection().await?;
         let _: () = pipe.query_async(&mut redis).await?;
-        Ok(())
-    }
-
-    pub async fn finish_with_failure(&self, envelope: &JobEnvelope) -> Result<(), OxanaError> {
-        let mut redis = self.connection().await?;
-        let _: () = redis::pipe()
-            .lrem(self.current_processing_queue(), 1, &envelope.id)
-            .query_async(&mut redis)
-            .await?;
         Ok(())
     }
 
@@ -2331,6 +2332,36 @@ mod tests {
     struct TestJob {}
 
     impl crate::worker::Job for TestJob {}
+
+    #[tokio::test]
+    async fn malformed_retry_or_dead_destination_preserves_payload_and_claim() -> TestResult {
+        for terminal in [false, true] {
+            let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+            let queue = random_string();
+            let job = JobEnvelope::new(queue.clone(), TestJob {})?;
+            storage.enqueue(job.clone()).await?;
+            assert_eq!(storage.dequeue(&queue).await?, Some(job.id.clone()));
+            let mut redis = storage.connection().await?;
+            let destination = if terminal {
+                &storage.keys.dead
+            } else {
+                &storage.keys.retry
+            };
+            let _: () = redis.set(destination, "wrong type").await?;
+            let result = if terminal {
+                storage.kill(&job, "failed".into()).await
+            } else {
+                storage.retry_in(job.id.clone(), 0, "failed".into()).await
+            };
+            assert!(result.is_err());
+            assert_eq!(storage.get_job(&job.id).await?.unwrap().meta.retries, 0);
+            let claimed: Vec<String> = redis
+                .lrange(storage.current_processing_queue(), 0, -1)
+                .await?;
+            assert_eq!(claimed, vec![job.id]);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn claimed_payload_read_retries_pool_saturation() -> TestResult {
@@ -3884,8 +3915,6 @@ mod tests {
         storage.enqueue(envelope2.clone()).await?;
         assert_eq!(storage.dequeue(&queue).await?, Some(envelope1.id.clone()));
         assert_eq!(storage.dequeue(&queue).await?, Some(envelope2.id.clone()));
-        storage.finish_with_failure(&envelope1).await?;
-        storage.finish_with_failure(&envelope2).await?;
         storage
             .retry_in(envelope1.id.clone(), 3_600, "first failed".to_string())
             .await?;

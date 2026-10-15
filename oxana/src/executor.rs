@@ -388,16 +388,14 @@ async fn handle_err<DT>(
     DT: Send + Sync + Clone + 'static,
 {
     if envelope.meta.retries < max_retries {
-        if let Err(e) = config.storage.internal.finish_with_failure(envelope).await {
-            tracing::error!("Failed to finish job: {}", e);
-        }
         if let Err(e) = config
             .storage
             .internal
             .retry_in(envelope.id.clone(), retry_delay, err_msg.to_string())
             .await
         {
-            tracing::error!("Failed to retry job: {}", e);
+            // A live heartbeat would otherwise keep the abandoned claim unrecoverable.
+            config.fail(e);
         }
     } else {
         tracing::error!(
@@ -412,7 +410,7 @@ async fn handle_err<DT>(
             .kill(envelope, err_msg.to_string())
             .await
         {
-            tracing::error!("Failed to kill job: {}", e);
+            config.fail(e);
         }
     }
 }

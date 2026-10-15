@@ -20,6 +20,7 @@ struct FaultState {
     prefix: Vec<String>,
     disconnect: bool,
     repeat: bool,
+    reject_before: bool,
     injected: AtomicBool,
     faults: AtomicUsize,
     claims: AtomicUsize,
@@ -29,11 +30,15 @@ struct FaultState {
 
 impl RedisProxy {
     pub async fn start(command_prefix: Vec<String>, disconnect: bool) -> TestResult<Self> {
-        Self::start_with_fault(command_prefix, disconnect, false).await
+        Self::start_with_fault(command_prefix, disconnect, false, false).await
+    }
+
+    pub async fn reject_once(command_prefix: Vec<String>) -> TestResult<Self> {
+        Self::start_with_fault(command_prefix, false, false, true).await
     }
 
     pub async fn failing_reads(command_prefix: Vec<String>) -> TestResult<Self> {
-        Self::start_with_fault(command_prefix, false, true).await
+        Self::start_with_fault(command_prefix, false, true, false).await
     }
 
     pub fn injected(&self) -> bool {
@@ -60,6 +65,7 @@ impl RedisProxy {
         command_prefix: Vec<String>,
         disconnect: bool,
         repeat: bool,
+        reject_before: bool,
     ) -> TestResult<Self> {
         let client = redis::Client::open(std::env::var("REDIS_URL")?)?;
         let info = client.get_connection_info().clone();
@@ -76,6 +82,7 @@ impl RedisProxy {
             prefix: command_prefix,
             disconnect,
             repeat,
+            reject_before,
             injected: AtomicBool::new(false),
             faults: AtomicUsize::new(0),
             claims: AtomicUsize::new(0),
@@ -128,19 +135,33 @@ async fn forward(
         if fault.outage.load(Ordering::SeqCst) {
             return Ok(());
         }
-        upstream.get_mut().write_all(&request).await?;
-        let response = read_frame(&mut upstream).await?;
         let command: Vec<String> =
             redis::from_redis_value(redis::parse_redis_value(&request).map_err(io::Error::other)?)
                 .map_err(io::Error::other)?;
+        if fault.reject_before
+            && command.starts_with(&fault.prefix)
+            && !fault.injected.swap(true, Ordering::SeqCst)
+        {
+            fault.faults.fetch_add(1, Ordering::SeqCst);
+            socket
+                .get_mut()
+                .write_all(b"-ERR injected write rejection\r\n")
+                .await?;
+            continue;
+        }
+        upstream.get_mut().write_all(&request).await?;
+        let response = read_frame(&mut upstream).await?;
+
         if command.first().is_some_and(|name| name == "LMOVE")
             && response.starts_with(b"$")
             && response != b"$-1\r\n"
         {
             fault.claims.fetch_add(1, Ordering::SeqCst);
         }
-        if command.starts_with(&fault.prefix)
-            && response != b"$-1\r\n"
+        if !fault.reject_before
+            && command.starts_with(&fault.prefix)
+            && !response.starts_with(b"-")
+            && (command.first().is_some_and(|name| name == "EVALSHA") || response != b"$-1\r\n")
             && fault.fail_reads.load(Ordering::SeqCst)
             && (fault.repeat || !fault.injected.swap(true, Ordering::SeqCst))
         {
