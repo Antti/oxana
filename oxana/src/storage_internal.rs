@@ -132,6 +132,7 @@ impl StorageInternal {
             self.stats_pool.clone(),
             Some(self.keys.namespace.clone()),
         )
+        .with_dead_job_limit(self.dead_job_limit)
     }
 
     fn record_redis_success(&self) {
