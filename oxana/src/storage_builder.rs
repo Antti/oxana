@@ -11,6 +11,7 @@ pub struct StorageBuilder {
     max_pool_size: Option<usize>,
     timeouts: Option<StorageBuilderTimeouts>,
     redis_response_timeout: Option<Duration>,
+    dead_job_limit: Option<std::num::NonZeroUsize>,
 }
 
 #[derive(Clone, Copy)]
@@ -63,11 +64,21 @@ impl StorageBuilder {
             max_pool_size: None,
             timeouts: None,
             redis_response_timeout: None,
+            dead_job_limit: std::num::NonZeroUsize::new(1000),
         }
     }
 
     pub fn namespace(mut self, namespace: impl Into<String>) -> Self {
         self.namespace = Some(namespace.into());
+        self
+    }
+
+    /// Maximum retained dead payloads, shared by every queue in this namespace.
+    /// Defaults to 1,000. Use `None` to retain all dead jobs until explicitly
+    /// revived or removed; monitor Redis memory when disabling the limit.
+    /// Configure the same limit on every consumer of the namespace.
+    pub fn dead_job_limit(mut self, limit: Option<std::num::NonZeroUsize>) -> Self {
+        self.dead_job_limit = limit;
         self
     }
 
@@ -95,7 +106,10 @@ impl StorageBuilder {
                 .unwrap_or(DEFAULT_REDIS_RESPONSE_TIMEOUT),
         )?;
 
-        Ok(Storage::new(StorageInternal::new(pool, self.namespace)))
+        Ok(Storage::new(
+            StorageInternal::new(pool, self.namespace)
+                .with_dead_job_limit(self.dead_job_limit.map(std::num::NonZeroUsize::get)),
+        ))
     }
 
     pub fn build_from_redis_urls(
@@ -112,11 +126,10 @@ impl StorageBuilder {
         let stats_pool =
             Self::build_redis_pool(stats_url, max_pool_size, timeouts, redis_response_timeout)?;
 
-        Ok(Storage::new(StorageInternal::with_stats_pool(
-            pool,
-            stats_pool,
-            self.namespace,
-        )))
+        Ok(Storage::new(
+            StorageInternal::with_stats_pool(pool, stats_pool, self.namespace)
+                .with_dead_job_limit(self.dead_job_limit.map(std::num::NonZeroUsize::get)),
+        ))
     }
 
     fn build_redis_pool(
@@ -172,7 +185,8 @@ impl StorageBuilder {
     /// `redis_response_timeout` settings do not apply here — the provided pool
     /// is used as-is.
     pub fn build_from_pool(self, pool: deadpool_redis::Pool) -> Result<Storage, OxanaError> {
-        let internal = StorageInternal::new(pool, self.namespace);
+        let internal = StorageInternal::new(pool, self.namespace)
+            .with_dead_job_limit(self.dead_job_limit.map(std::num::NonZeroUsize::get));
         Ok(Storage::new(internal))
     }
 
@@ -186,7 +200,8 @@ impl StorageBuilder {
         pool: deadpool_redis::Pool,
         stats_pool: deadpool_redis::Pool,
     ) -> Result<Storage, OxanaError> {
-        let internal = StorageInternal::with_stats_pool(pool, stats_pool, self.namespace);
+        let internal = StorageInternal::with_stats_pool(pool, stats_pool, self.namespace)
+            .with_dead_job_limit(self.dead_job_limit.map(std::num::NonZeroUsize::get));
         Ok(Storage::new(internal))
     }
 }

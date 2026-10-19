@@ -512,3 +512,113 @@ async fn run_replacement(
         .exit_when_processed(1);
     Ok(tokio::time::timeout(WAIT, replacement.run()).await??)
 }
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FailureJob {
+    terminal: bool,
+}
+impl oxana::Job for FailureJob {}
+struct FailureWorker(bool);
+impl oxana::FromContext<bool> for FailureWorker {
+    fn from_context(fail: &bool) -> Self {
+        Self(*fail)
+    }
+}
+#[async_trait::async_trait]
+impl oxana::Worker<FailureJob> for FailureWorker {
+    type Error = std::io::Error;
+    async fn process(&self, _: FailureJob, _: &oxana::JobContext) -> Result<(), Self::Error> {
+        if self.0 {
+            Err(std::io::Error::other("injected handler failure"))
+        } else {
+            Ok(())
+        }
+    }
+    fn max_retries(&self, job: &FailureJob) -> u32 {
+        if job.terminal { 0 } else { 11 }
+    }
+    fn retry_delay(&self, _: &FailureJob, _: u32) -> u64 {
+        3600
+    }
+}
+
+#[tokio::test]
+async fn failed_handoff_retains_recoverable_work_before_or_after_commit() -> TestResult {
+    for terminal in [false, true] {
+        for committed in [false, true] {
+            let pool = setup();
+            let namespace = random_string();
+            let queue = random_string();
+            let storage = Storage::builder()
+                .namespace(&namespace)
+                .build_from_pool(pool.clone())?;
+            let id = storage
+                .enqueue(RecoveryQueue(queue.clone()), FailureJob { terminal })
+                .await?;
+            let script = deadpool_redis::redis::Script::new(if terminal {
+                include_str!("../../src/finish_dead.lua")
+            } else {
+                include_str!("../../src/retry_failed.lua")
+            });
+            let prefix = vec![
+                "EVALSHA".into(),
+                script.get_hash().into(),
+                "3".into(),
+                format!("{namespace}:jobs"),
+            ];
+            let proxy = if committed {
+                RedisProxy::start(prefix, true).await?
+            } else {
+                RedisProxy::reject_once(prefix).await?
+            };
+            let runtime_storage = Storage::builder()
+                .namespace(&namespace)
+                .build_from_pool(proxy.pool.clone())?;
+            let result = tokio::time::timeout(
+                WAIT,
+                runtime_storage
+                    .runtime(true)
+                    .queue_with(QueueConfig::as_static(&queue).concurrency(1))
+                    .worker::<FailureWorker, FailureJob>()
+                    .dequeue_timeout(Duration::from_millis(10))
+                    .run(),
+            )
+            .await?;
+            assert!(proxy.injected());
+            assert!(
+                result.is_err(),
+                "a failed handoff must stop heartbeating its abandoned claims"
+            );
+            if terminal && committed {
+                assert_eq!(storage.dead_count().await?, 1);
+                assert!(storage.get_job(&id).await?.is_none());
+            } else {
+                assert!(storage.get_job(&id).await?.is_some());
+                storage.retry_all_now().await?;
+                let stats = tokio::time::timeout(
+                    WAIT,
+                    storage
+                        .runtime(false)
+                        .queue_with(QueueConfig::as_static(&queue).concurrency(1))
+                        .worker::<FailureWorker, FailureJob>()
+                        .resurrect_scan_interval(Duration::from_millis(10))
+                        .dequeue_timeout(Duration::from_millis(10))
+                        .exit_when_processed(1)
+                        .run(),
+                )
+                .await??;
+                assert_eq!(stats.succeeded, 1);
+                assert!(storage.get_job(&id).await?.is_none());
+            }
+            assert_eq!(storage.enqueued_count(RecoveryQueue(queue)).await?, 0);
+            assert_eq!(storage.retries_count().await?, 0);
+            let mut redis = pool.get().await?;
+            let keys: Vec<String> = redis.keys(format!("{namespace}:processing:*")).await?;
+            for key in keys {
+                let remaining: usize = redis.llen(key).await?;
+                assert_eq!(remaining, 0);
+            }
+        }
+    }
+    Ok(())
+}
