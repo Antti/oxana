@@ -6,6 +6,7 @@ use deadpool_redis::redis::{self, ConnectionAddr};
 use testresult::TestResult;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
 
 /// Forwards RESP2 traffic to real Redis, with controlled response failures.
@@ -26,6 +27,9 @@ struct FaultState {
     claims: AtomicUsize,
     outage: AtomicBool,
     fail_reads: AtomicBool,
+    pause_reads: AtomicBool,
+    paused: Notify,
+    resume: Notify,
 }
 
 impl RedisProxy {
@@ -39,6 +43,22 @@ impl RedisProxy {
 
     pub async fn failing_reads(command_prefix: Vec<String>) -> TestResult<Self> {
         Self::start_with_fault(command_prefix, false, true, false).await
+    }
+
+    /// Hold one matching response after Redis has executed the command.
+    pub async fn pause_once(command_prefix: Vec<String>) -> TestResult<Self> {
+        let proxy = Self::start_with_fault(command_prefix, false, false, false).await?;
+        proxy.fault.fail_reads.store(false, Ordering::SeqCst);
+        proxy.fault.pause_reads.store(true, Ordering::SeqCst);
+        Ok(proxy)
+    }
+
+    pub async fn wait_until_paused(&self) {
+        self.fault.paused.notified().await;
+    }
+
+    pub fn resume(&self) {
+        self.fault.resume.notify_one();
     }
 
     pub fn injected(&self) -> bool {
@@ -88,6 +108,9 @@ impl RedisProxy {
             claims: AtomicUsize::new(0),
             outage: AtomicBool::new(false),
             fail_reads: AtomicBool::new(true),
+            pause_reads: AtomicBool::new(false),
+            paused: Notify::new(),
+            resume: Notify::new(),
         });
         let task_fault = Arc::clone(&fault);
         let task = tokio::spawn(async move {
@@ -152,6 +175,14 @@ async fn forward(
         upstream.get_mut().write_all(&request).await?;
         let response = read_frame(&mut upstream).await?;
 
+        if fault.pause_reads.load(Ordering::SeqCst)
+            && command.starts_with(&fault.prefix)
+            && !fault.injected.swap(true, Ordering::SeqCst)
+        {
+            fault.paused.notify_one();
+            fault.resume.notified().await;
+        }
+
         if command.first().is_some_and(|name| name == "LMOVE")
             && response.starts_with(b"$")
             && response != b"$-1\r\n"
@@ -191,13 +222,17 @@ async fn read_frame(stream: &mut BufReader<TcpStream>) -> io::Result<Vec<u8>> {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
         remaining -= 1;
-        match frame[start] {
+        let prefix = *frame.get(start).ok_or(io::ErrorKind::UnexpectedEof)?;
+        match prefix {
             b'*' | b'$' => {
-                let length: i64 = std::str::from_utf8(&frame[start + 1..frame.len() - 2])
+                let digits = frame
+                    .get(start + 1..frame.len().saturating_sub(2))
+                    .ok_or(io::ErrorKind::InvalidData)?;
+                let length: i64 = std::str::from_utf8(digits)
                     .map_err(io::Error::other)?
                     .parse()
                     .map_err(io::Error::other)?;
-                if frame[start] == b'*' {
+                if prefix == b'*' {
                     remaining += length.max(0);
                 } else if length >= 0 {
                     let start = frame.len();
@@ -205,7 +240,8 @@ async fn read_frame(stream: &mut BufReader<TcpStream>) -> io::Result<Vec<u8>> {
                         start + usize::try_from(length).map_err(io::Error::other)? + 2,
                         0,
                     );
-                    stream.read_exact(&mut frame[start..]).await?;
+                    let body = frame.get_mut(start..).ok_or(io::ErrorKind::UnexpectedEof)?;
+                    stream.read_exact(body).await?;
                 }
             }
             b'+' | b'-' | b':' => {}

@@ -2,7 +2,6 @@ use deadpool_redis::redis::{self, AsyncCommands};
 use futures::TryStreamExt;
 use std::{
     collections::{HashMap, HashSet},
-    num::NonZero,
     sync::Arc,
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
@@ -22,6 +21,9 @@ use crate::{
 };
 
 mod queue_stats;
+
+#[cfg(test)]
+mod transition_tests;
 
 use queue_stats::{aggregate_queue_stats, queue_rate_stats};
 
@@ -580,11 +582,18 @@ impl StorageInternal {
         delay_s: u64,
         error: String,
     ) -> Result<(), OxanaError> {
-        let updated_envelope = self
-            .get_job(&job_id)
-            .await?
-            .ok_or(OxanaError::JobNotFound)?
-            .with_retries_incremented(error);
+        let Some(envelope) = self.get_job(&job_id).await? else {
+            // Dashboard deletion or retention cleanup can remove a running job.
+            // Release its claim without touching a replacement payload or retry.
+            // Redis errors still propagate so the runtime stops heartbeating.
+            let mut redis = self.connection().await?;
+            let _: usize = redis
+                .lrem(self.current_processing_queue(), 1, &job_id)
+                .await?;
+            tracing::warn!(job_id, "Job payload removed before retry; released claim");
+            return Ok(());
+        };
+        let updated_envelope = envelope.with_retries_incremented(error);
 
         let now = chrono::Utc::now().timestamp_micros() as u64;
 
@@ -815,13 +824,8 @@ impl StorageInternal {
     }
 
     pub async fn finish_with_success(&self, envelope: &JobEnvelope) -> Result<(), OxanaError> {
-        let mut redis = self.connection().await?;
-        let _: () = redis::pipe()
-            .hdel(&self.keys.jobs, &envelope.id)
-            .lrem(self.current_processing_queue(), 1, &envelope.id)
-            .query_async(&mut redis)
-            .await?;
-        Ok(())
+        self.finish_with_success_batch(std::slice::from_ref(envelope))
+            .await
     }
 
     pub async fn finish_with_success_batch(
@@ -831,85 +835,81 @@ impl StorageInternal {
         if envelopes.is_empty() {
             return Ok(());
         }
-
-        let job_ids = envelopes
-            .iter()
-            .map(|envelope| envelope.id.as_str())
-            .collect::<Vec<_>>();
-        let processing_queue = self.current_processing_queue();
-        let mut pipe = redis::pipe();
-        pipe.hdel(&self.keys.jobs, &job_ids);
-        for job_id in job_ids {
-            pipe.lrem(&processing_queue, 1, job_id);
+        static FINISH: std::sync::LazyLock<redis::Script> =
+            std::sync::LazyLock::new(|| redis::Script::new(include_str!("finish_success.lua")));
+        let mut invocation = FINISH.prepare_invoke();
+        invocation
+            .key(&self.keys.jobs)
+            .key(self.current_processing_queue());
+        for envelope in envelopes {
+            invocation.arg(&envelope.id);
         }
-
         let mut redis = self.connection().await?;
-        let _: () = pipe.query_async(&mut redis).await?;
+        let _: () = invocation.invoke_async(&mut *redis).await?;
         Ok(())
     }
 
     pub async fn enqueue_scheduled(&self, schedule_queue: &str) -> Result<usize, OxanaError> {
         let now = chrono::Utc::now().timestamp_micros();
         let mut redis = self.connection().await?;
-        let job_ids: Vec<JobId> = redis.zrangebyscore(schedule_queue, 0, now).await?;
-
-        self.claim_and_enqueue_scheduled_job_ids(&mut redis, schedule_queue, job_ids)
+        let jobs: Vec<(JobId, f64)> = redis
+            .zrangebyscore_withscores(schedule_queue, 0, now)
+            .await?;
+        self.promote_scheduled_jobs(&mut redis, schedule_queue, jobs)
             .await
     }
 
-    async fn claim_and_enqueue_scheduled_job_ids(
+    async fn promote_scheduled_jobs(
         &self,
         redis: &mut deadpool_redis::Connection,
         schedule_queue: &str,
-        job_ids: Vec<JobId>,
+        jobs: Vec<(JobId, f64)>,
     ) -> Result<usize, OxanaError> {
-        if job_ids.is_empty() {
-            return Ok(0);
+        static PROMOTE: std::sync::LazyLock<redis::Script> =
+            std::sync::LazyLock::new(|| redis::Script::new(include_str!("promote_scheduled.lua")));
+        let mut count = 0;
+        for (id, score) in jobs {
+            let (payload, envelope) = match self.transition_snapshot(redis, &id).await {
+                Ok(snapshot) => snapshot,
+                Err(OxanaError::JsonError(error)) => {
+                    tracing::warn!(job_id = id, %error, "Skipping malformed scheduled payload");
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let queue = envelope
+                .as_ref()
+                .map_or("", |envelope| envelope.queue.as_str());
+            let moved: usize = PROMOTE
+                .key(&self.keys.jobs)
+                .key(schedule_queue)
+                .key(self.namespace_queue(queue))
+                .arg(id)
+                .arg(payload.unwrap_or_default())
+                .arg(score)
+                .invoke_async(&mut **redis)
+                .await?;
+            count += moved;
         }
+        Ok(count)
+    }
 
-        let mut claim_pipe = redis::pipe();
-        for job_id in &job_ids {
-            claim_pipe.zrem(schedule_queue, job_id);
-        }
-        let claimed: Vec<u32> = claim_pipe.query_async(&mut *redis).await?;
-
-        let claimed_job_ids: Vec<JobId> = job_ids
-            .into_iter()
-            .zip(claimed)
-            .filter(|(_, removed)| *removed > 0)
-            .map(|(id, _)| id)
-            .collect();
-
-        if claimed_job_ids.is_empty() {
-            return Ok(0);
-        }
-
-        let envelopes = self.get_many(&claimed_job_ids).await?;
-        let envelopes_count = envelopes.len();
-
-        let mut enqueue_pipe = redis::pipe();
-        let mut map: HashMap<&str, Vec<&str>> = HashMap::new();
-
-        for envelope in envelopes.iter() {
-            map.entry(&envelope.queue)
-                .or_default()
-                .push(envelope.id.as_str());
-        }
-
-        for (queue, job_ids) in map {
-            enqueue_pipe.lpush(self.namespace_queue(queue), job_ids);
-        }
-
-        let _: () = enqueue_pipe.query_async(&mut *redis).await?;
-
-        Ok(envelopes_count)
+    // Keep the original JSON for a compare-and-move check, without parsing or
+    // re-encoding potentially large job arguments inside Redis.
+    async fn transition_snapshot(
+        &self,
+        redis: &mut deadpool_redis::Connection,
+        id: &JobId,
+    ) -> Result<(Option<String>, Option<JobEnvelope>), OxanaError> {
+        let payload: Option<String> = redis.hget(&self.keys.jobs, id).await?;
+        let envelope = payload.as_deref().map(serde_json::from_str).transpose()?;
+        Ok((payload, envelope))
     }
 
     pub async fn retry_all_now(&self) -> Result<usize, OxanaError> {
         let mut redis = self.connection().await?;
-        let job_ids: Vec<JobId> = (*redis).zrange(&self.keys.retry, 0, -1).await?;
-
-        self.claim_and_enqueue_scheduled_job_ids(&mut redis, &self.keys.retry, job_ids)
+        let jobs: Vec<(JobId, f64)> = redis.zrange_withscores(&self.keys.retry, 0, -1).await?;
+        self.promote_scheduled_jobs(&mut redis, &self.keys.retry, jobs)
             .await
     }
 
@@ -1992,51 +1992,63 @@ impl StorageInternal {
 
             let processing_queue = self.processing_queue(&process_id);
             let mut resurrected_count = 0;
+            // Snapshot IDs once: positional cursors skip work when another
+            // recovery pass shrinks the list. Payloads are still read one at a
+            // time, and the script checks ownership before moving each claim.
+            let job_ids: Vec<JobId> = redis.lrange(&processing_queue, 0, -1).await?;
 
-            loop {
-                let job_ids: Vec<String> = (*redis)
-                    .lpop(&processing_queue, Some(NonZero::new(10).unwrap()))
+            for id in job_ids {
+                let (payload, envelope) = match self.transition_snapshot(&mut redis, &id).await {
+                    Ok(snapshot) => snapshot,
+                    Err(OxanaError::JsonError(error)) => {
+                        tracing::warn!(job_id = id, %error, "Skipping malformed recovery payload");
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let queue = envelope
+                    .as_ref()
+                    .map_or("", |envelope| envelope.queue.as_str());
+                let should_resurrect = envelope
+                    .as_ref()
+                    .is_some_and(|envelope| envelope.meta.resurrect);
+                static RESURRECT: std::sync::LazyLock<redis::Script> =
+                    std::sync::LazyLock::new(|| {
+                        redis::Script::new(include_str!("resurrect_claim.lua"))
+                    });
+                let moved: usize = RESURRECT
+                    .key(&self.keys.jobs)
+                    .key(&processing_queue)
+                    .key(self.namespace_queue(queue))
+                    .arg(&id)
+                    .arg(payload.unwrap_or_default())
+                    .arg(usize::from(should_resurrect))
+                    .invoke_async(&mut *redis)
                     .await?;
-
-                if job_ids.is_empty() {
-                    break;
-                }
-
-                resurrected_count += job_ids.len();
-
-                for job_id in job_ids {
-                    match self.get_job_w_conn(&mut redis, &job_id).await? {
-                        Some(envelope) => {
-                            if envelope.meta.resurrect {
-                                tracing::info!(
-                                    job_id = job_id,
-                                    queue = envelope.queue,
-                                    job = envelope.job.name,
-                                    "Resurrecting job"
-                                );
-                                let _: () = (*redis)
-                                    .lpush(self.namespace_queue(&envelope.queue), &envelope.id)
-                                    .await?;
-                            } else {
-                                tracing::info!(
-                                    job_id = job_id,
-                                    queue = envelope.queue,
-                                    job = envelope.job.name,
-                                    "Skipping resurrection (resurrect=false), deleting job"
-                                );
-                                let _: () = (*redis).hdel(&self.keys.jobs, &envelope.id).await?;
-                            }
+                resurrected_count += moved;
+                if moved > 0 {
+                    match envelope {
+                        Some(envelope) => tracing::info!(
+                            job_id = id,
+                            queue = envelope.queue,
+                            job = envelope.job.name,
+                            resurrected = should_resurrect,
+                            "Recovered interrupted job"
+                        ),
+                        None => {
+                            tracing::warn!(job_id = id, "Job payload not found during recovery");
                         }
-                        None => tracing::warn!("Job {} not found", job_id),
                     }
                 }
             }
 
-            let _: () = redis::pipe()
-                .zrem(&self.keys.processes, &process_id)
-                .hdel(&self.keys.processes_data, &process_id)
-                .query_async(&mut redis)
-                .await?;
+            if redis.llen::<_, usize>(&processing_queue).await? == 0 {
+                let _: () = redis::pipe()
+                    .zrem(&self.keys.processes, &process_id)
+                    .hdel(&self.keys.processes_data, &process_id)
+                    .query_async(&mut redis)
+                    .await?;
+            }
 
             if resurrected_count > 0 {
                 tracing::info!(
