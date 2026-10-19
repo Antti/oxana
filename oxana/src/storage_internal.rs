@@ -582,11 +582,18 @@ impl StorageInternal {
         delay_s: u64,
         error: String,
     ) -> Result<(), OxanaError> {
-        let updated_envelope = self
-            .get_job(&job_id)
-            .await?
-            .ok_or(OxanaError::JobNotFound)?
-            .with_retries_incremented(error);
+        let Some(envelope) = self.get_job(&job_id).await? else {
+            // Dashboard deletion or retention cleanup can remove a running job.
+            // Release its claim without touching a replacement payload or retry.
+            // Redis errors still propagate so the runtime stops heartbeating.
+            let mut redis = self.connection().await?;
+            let _: usize = redis
+                .lrem(self.current_processing_queue(), 1, &job_id)
+                .await?;
+            tracing::warn!(job_id, "Job payload removed before retry; released claim");
+            return Ok(());
+        };
+        let updated_envelope = envelope.with_retries_incremented(error);
 
         let now = chrono::Utc::now().timestamp_micros() as u64;
 
@@ -862,7 +869,14 @@ impl StorageInternal {
             std::sync::LazyLock::new(|| redis::Script::new(include_str!("promote_scheduled.lua")));
         let mut count = 0;
         for (id, score) in jobs {
-            let (payload, envelope) = self.transition_snapshot(redis, &id).await?;
+            let (payload, envelope) = match self.transition_snapshot(redis, &id).await {
+                Ok(snapshot) => snapshot,
+                Err(OxanaError::JsonError(error)) => {
+                    tracing::warn!(job_id = id, %error, "Skipping malformed scheduled payload");
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let queue = envelope
                 .as_ref()
                 .map_or("", |envelope| envelope.queue.as_str());
@@ -1978,15 +1992,26 @@ impl StorageInternal {
 
             let processing_queue = self.processing_queue(&process_id);
             let mut resurrected_count = 0;
+            let mut offset = 0;
 
             loop {
-                let job_ids: Vec<JobId> = redis.lrange(&processing_queue, 0, 9).await?;
+                let job_ids: Vec<JobId> =
+                    redis.lrange(&processing_queue, offset, offset + 9).await?;
                 if job_ids.is_empty() {
                     break;
                 }
 
                 for id in job_ids {
-                    let (payload, envelope) = self.transition_snapshot(&mut redis, &id).await?;
+                    let (payload, envelope) = match self.transition_snapshot(&mut redis, &id).await
+                    {
+                        Ok(snapshot) => snapshot,
+                        Err(OxanaError::JsonError(error)) => {
+                            tracing::warn!(job_id = id, %error, "Skipping malformed recovery payload");
+                            offset += 1;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let queue = envelope
                         .as_ref()
                         .map_or("", |envelope| envelope.queue.as_str());
@@ -2007,6 +2032,12 @@ impl StorageInternal {
                         .invoke_async(&mut *redis)
                         .await?;
                     resurrected_count += moved;
+                    // Successful moves shrink the list. Advance only past
+                    // retained claims, leaving them for a later sweep. Concurrent
+                    // removals may defer some jobs to the next sweep as well.
+                    if moved == 0 {
+                        offset += 1;
+                    }
                     if moved > 0 {
                         match envelope {
                             Some(envelope) => tracing::info!(
@@ -2027,11 +2058,13 @@ impl StorageInternal {
                 }
             }
 
-            let _: () = redis::pipe()
-                .zrem(&self.keys.processes, &process_id)
-                .hdel(&self.keys.processes_data, &process_id)
-                .query_async(&mut redis)
-                .await?;
+            if offset == 0 {
+                let _: () = redis::pipe()
+                    .zrem(&self.keys.processes, &process_id)
+                    .hdel(&self.keys.processes_data, &process_id)
+                    .query_async(&mut redis)
+                    .await?;
+            }
 
             if resurrected_count > 0 {
                 tracing::info!(

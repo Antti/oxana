@@ -47,6 +47,160 @@ fn script_prefix(script: &str, storage: &StorageInternal, keys: usize) -> Vec<St
 }
 
 #[tokio::test]
+async fn regression_retry_missing_payload_releases_only_its_claim() -> TestResult {
+    let (storage, envelope) = fixture().await?;
+    storage.dequeue(&envelope.queue).await?;
+    let mut redis = storage.connection().await?;
+    let _: () = redis.hdel(&storage.keys.jobs, &envelope.id).await?;
+
+    storage.retry_in(envelope.id, 0, "failed".into()).await?;
+
+    assert_eq!(
+        redis
+            .llen::<_, usize>(storage.current_processing_queue())
+            .await?,
+        0
+    );
+    assert_eq!(storage.retries_count().await?, 0);
+    assert_eq!(storage.jobs_count().await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn regression_missing_payload_claim_cleanup_errors_are_propagated() -> TestResult {
+    let (storage, envelope) = fixture().await?;
+    storage.dequeue(&envelope.queue).await?;
+    let mut redis = storage.connection().await?;
+    let _: () = redis.hdel(&storage.keys.jobs, &envelope.id).await?;
+    let proxy =
+        RedisProxy::reject_once(vec!["LREM".into(), storage.current_processing_queue()]).await?;
+    let mut through_proxy = storage.clone();
+    through_proxy.pool = proxy.pool.clone();
+
+    assert!(
+        through_proxy
+            .retry_in(envelope.id.clone(), 0, "failed".into())
+            .await
+            .is_err()
+    );
+    assert!(proxy.injected());
+    assert_eq!(
+        storage.currently_processing_job_ids().await?,
+        vec![envelope.id]
+    );
+    assert_eq!(storage.retries_count().await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn regression_malformed_scheduled_payload_does_not_block_healthy_jobs() -> TestResult {
+    for retry in [false, true] {
+        let (storage, malformed) = fixture().await?;
+        let source = schedule(&storage, &malformed, retry).await?;
+        let healthy = JobEnvelope::new(malformed.queue.clone(), TransitionJob)?;
+        storage.enqueue(healthy.clone()).await?;
+        schedule(&storage, &healthy, retry).await?;
+        let mut redis = storage.connection().await?;
+        let _: () = redis::pipe()
+            .hset(&storage.keys.jobs, &malformed.id, "{invalid json")
+            .zadd(&source, &healthy.id, 2)
+            .query_async(&mut redis)
+            .await?;
+
+        assert_eq!(storage.enqueue_scheduled(&source).await?, 1);
+        assert_eq!(storage.enqueue_scheduled(&source).await?, 0);
+        let retained: Vec<String> = redis.zrange(&source, 0, -1).await?;
+        assert_eq!(retained, vec![malformed.id.clone()]);
+        assert_eq!(
+            redis
+                .hget::<_, _, String>(&storage.keys.jobs, &malformed.id)
+                .await?,
+            "{invalid json"
+        );
+        assert_eq!(storage.enqueued_count(&healthy.queue).await?, 1);
+
+        storage.update_job(&malformed).await?;
+        assert_eq!(storage.enqueue_scheduled(&source).await?, 1);
+        assert_eq!(redis.zcard::<_, usize>(&source).await?, 0);
+        assert_eq!(storage.enqueued_count(&healthy.queue).await?, 2);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn regression_malformed_claims_do_not_block_recovery() -> TestResult {
+    let (storage, first) = fixture().await?;
+    // More than one recovery batch, with malformed claims at both ends and
+    // in the middle, exercises scanning past retained entries.
+    let mut jobs = vec![first.clone()];
+    for _ in 0..24 {
+        let job = JobEnvelope::new(first.queue.clone(), TransitionJob)?;
+        storage.enqueue(job.clone()).await?;
+        jobs.push(job);
+    }
+    for _ in &jobs {
+        storage.dequeue(&first.queue).await?;
+    }
+    let other = storage.for_new_process();
+    let other_job = JobEnvelope::new(first.queue.clone(), TransitionJob)?;
+    other.enqueue(other_job.clone()).await?;
+    other.dequeue(&first.queue).await?;
+
+    let mut redis = storage.connection().await?;
+    let malformed = [
+        jobs.first().unwrap(),
+        jobs.get(12).unwrap(),
+        jobs.last().unwrap(),
+    ];
+    for job in malformed {
+        let _: () = redis
+            .hset(&storage.keys.jobs, &job.id, "{invalid json")
+            .await?;
+    }
+
+    for _ in 0..2 {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            storage.resurrect(Duration::from_secs(5)),
+        )
+        .await??;
+        assert_eq!(storage.enqueued_count(&first.queue).await?, 23);
+        let retained: Vec<String> = redis
+            .lrange(storage.current_processing_queue(), 0, -1)
+            .await?;
+        assert_eq!(retained.len(), malformed.len());
+        for job in malformed {
+            assert!(retained.contains(&job.id));
+            assert_eq!(
+                redis
+                    .hget::<_, _, String>(&storage.keys.jobs, &job.id)
+                    .await?,
+                "{invalid json"
+            );
+        }
+        assert_eq!(
+            redis
+                .llen::<_, usize>(other.current_processing_queue())
+                .await?,
+            0
+        );
+    }
+
+    for job in malformed {
+        storage.update_job(job).await?;
+    }
+    storage.resurrect(Duration::from_secs(5)).await?;
+    assert_eq!(storage.enqueued_count(&first.queue).await?, 26);
+    assert_eq!(
+        redis
+            .llen::<_, usize>(storage.current_processing_queue())
+            .await?,
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn scheduled_and_retry_transfers_survive_rejected_commands_and_lost_replies() -> TestResult {
     for retry in [false, true] {
         for committed in [false, true] {

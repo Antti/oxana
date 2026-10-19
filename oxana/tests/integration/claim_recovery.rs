@@ -542,6 +542,72 @@ impl oxana::Worker<FailureJob> for FailureWorker {
     }
 }
 
+struct DeletedJobWorker(Arc<State>);
+impl oxana::FromContext<Arc<State>> for DeletedJobWorker {
+    fn from_context(state: &Arc<State>) -> Self {
+        Self(Arc::clone(state))
+    }
+}
+#[async_trait::async_trait]
+impl oxana::Worker<RecoveryJob> for DeletedJobWorker {
+    type Error = std::io::Error;
+    async fn process(&self, job: RecoveryJob, ctx: &oxana::JobContext) -> Result<(), Self::Error> {
+        if job.block {
+            self.0.started.notify_one();
+            self.0.release.notified().await;
+            return Err(std::io::Error::other("failed after deletion"));
+        }
+        self.0.executed.lock().await.push(ctx.meta.id.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn regression_deleting_running_job_does_not_stop_runtime_on_failure() -> TestResult {
+    let pool = setup();
+    let namespace = random_string();
+    let queue = random_string();
+    let storage = Storage::builder()
+        .namespace(&namespace)
+        .build_from_pool(pool.clone())?;
+    // Dashboard requests have a different process identity from the worker.
+    let admin = Storage::builder()
+        .namespace(&namespace)
+        .build_from_pool(pool.clone())?;
+    let deleted = storage
+        .enqueue(RecoveryQueue(queue.clone()), RecoveryJob { block: true })
+        .await?;
+    let healthy = storage
+        .enqueue(RecoveryQueue(queue.clone()), RecoveryJob { block: false })
+        .await?;
+    let state = Arc::new(State::default());
+    let runtime = storage
+        .runtime(Arc::clone(&state))
+        .queue_with(QueueConfig::as_static(&queue).concurrency(1))
+        .worker::<DeletedJobWorker, RecoveryJob>()
+        .dequeue_timeout(Duration::from_millis(10))
+        .exit_when_processed(2);
+    let (result, deletion) = tokio::join!(tokio::time::timeout(WAIT, runtime.run()), async {
+        tokio::time::timeout(WAIT, state.started.notified()).await?;
+        admin.delete_job(&deleted).await?;
+        state.release.notify_one();
+        TestResult::Ok(())
+    });
+    deletion?;
+    let stats = result??;
+    assert_eq!(stats.failed, 1);
+    assert_eq!(stats.succeeded, 1);
+    assert_eq!(*state.executed.lock().await, vec![healthy]);
+    assert_eq!(storage.jobs_count().await?, 0);
+    assert_eq!(storage.retries_count().await?, 0);
+    let mut redis = pool.get().await?;
+    let keys: Vec<String> = redis.keys(format!("{namespace}:processing:*")).await?;
+    for key in keys {
+        assert_eq!(redis.llen::<_, usize>(key).await?, 0);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn failed_handoff_retains_recoverable_work_before_or_after_commit() -> TestResult {
     for terminal in [false, true] {
