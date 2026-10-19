@@ -394,6 +394,54 @@ async fn competing_recovery_processes_do_not_duplicate_claims() -> TestResult {
 }
 
 #[tokio::test]
+async fn recovery_snapshot_survives_concurrent_claim_removal() -> TestResult {
+    let (storage, envelope) = fixture().await?;
+    for _ in 0..12 {
+        storage
+            .enqueue(JobEnvelope::new(envelope.queue.clone(), TransitionJob)?)
+            .await?;
+    }
+    for _ in 0..13 {
+        storage.dequeue(&envelope.queue).await?;
+    }
+    let processing = storage.current_processing_queue();
+    let ready = storage.namespace_queue(&envelope.queue);
+    let proxy = RedisProxy::pause_once(vec!["LRANGE".into(), processing.clone()]).await?;
+    let through_proxy = StorageInternal::new(proxy.pool.clone(), Some(storage.namespace().into()));
+    let mut redis = storage.connection().await?;
+
+    let (recovery, competitor) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            through_proxy.resurrect(Duration::from_secs(5))
+        ),
+        async {
+            tokio::time::timeout(Duration::from_secs(5), proxy.wait_until_paused()).await?;
+            // Another recovery pass completes five claims after our LRANGE
+            // snapshot. Their removal must not advance our cursor past the tail.
+            for _ in 0..5 {
+                let _: String = redis::cmd("LMOVE")
+                    .arg(&processing)
+                    .arg(&ready)
+                    .arg("LEFT")
+                    .arg("LEFT")
+                    .query_async(&mut redis)
+                    .await?;
+            }
+            proxy.resume();
+            TestResult::Ok(())
+        }
+    );
+    competitor?;
+    recovery??;
+    assert_eq!(redis.llen::<_, usize>(&processing).await?, 0);
+    let recovered: Vec<String> = redis.lrange(&ready, 0, -1).await?;
+    assert_eq!(recovered.len(), 13);
+    assert_eq!(recovered.into_iter().collect::<HashSet<_>>().len(), 13);
+    Ok(())
+}
+
+#[tokio::test]
 async fn recovery_removes_missing_and_non_resurrectable_jobs() -> TestResult {
     for missing in [false, true] {
         let (storage, mut envelope) = fixture().await?;

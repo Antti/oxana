@@ -1,3 +1,5 @@
+// Also imported by storage unit tests, which use additional proxy controls.
+#[allow(dead_code)]
 mod redis_proxy;
 
 use std::sync::Arc;

@@ -1992,73 +1992,57 @@ impl StorageInternal {
 
             let processing_queue = self.processing_queue(&process_id);
             let mut resurrected_count = 0;
-            let mut offset = 0;
+            // Snapshot IDs once: positional cursors skip work when another
+            // recovery pass shrinks the list. Payloads are still read one at a
+            // time, and the script checks ownership before moving each claim.
+            let job_ids: Vec<JobId> = redis.lrange(&processing_queue, 0, -1).await?;
 
-            loop {
-                let job_ids: Vec<JobId> =
-                    redis.lrange(&processing_queue, offset, offset + 9).await?;
-                if job_ids.is_empty() {
-                    break;
-                }
-
-                for id in job_ids {
-                    let (payload, envelope) = match self.transition_snapshot(&mut redis, &id).await
-                    {
-                        Ok(snapshot) => snapshot,
-                        Err(OxanaError::JsonError(error)) => {
-                            tracing::warn!(job_id = id, %error, "Skipping malformed recovery payload");
-                            offset += 1;
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let queue = envelope
-                        .as_ref()
-                        .map_or("", |envelope| envelope.queue.as_str());
-                    let should_resurrect = envelope
-                        .as_ref()
-                        .is_some_and(|envelope| envelope.meta.resurrect);
-                    static RESURRECT: std::sync::LazyLock<redis::Script> =
-                        std::sync::LazyLock::new(|| {
-                            redis::Script::new(include_str!("resurrect_claim.lua"))
-                        });
-                    let moved: usize = RESURRECT
-                        .key(&self.keys.jobs)
-                        .key(&processing_queue)
-                        .key(self.namespace_queue(queue))
-                        .arg(&id)
-                        .arg(payload.unwrap_or_default())
-                        .arg(usize::from(should_resurrect))
-                        .invoke_async(&mut *redis)
-                        .await?;
-                    resurrected_count += moved;
-                    // Successful moves shrink the list. Advance only past
-                    // retained claims, leaving them for a later sweep. Concurrent
-                    // removals may defer some jobs to the next sweep as well.
-                    if moved == 0 {
-                        offset += 1;
+            for id in job_ids {
+                let (payload, envelope) = match self.transition_snapshot(&mut redis, &id).await {
+                    Ok(snapshot) => snapshot,
+                    Err(OxanaError::JsonError(error)) => {
+                        tracing::warn!(job_id = id, %error, "Skipping malformed recovery payload");
+                        continue;
                     }
-                    if moved > 0 {
-                        match envelope {
-                            Some(envelope) => tracing::info!(
-                                job_id = id,
-                                queue = envelope.queue,
-                                job = envelope.job.name,
-                                resurrected = should_resurrect,
-                                "Recovered interrupted job"
-                            ),
-                            None => {
-                                tracing::warn!(
-                                    job_id = id,
-                                    "Job payload not found during recovery"
-                                );
-                            }
+                    Err(error) => return Err(error),
+                };
+                let queue = envelope
+                    .as_ref()
+                    .map_or("", |envelope| envelope.queue.as_str());
+                let should_resurrect = envelope
+                    .as_ref()
+                    .is_some_and(|envelope| envelope.meta.resurrect);
+                static RESURRECT: std::sync::LazyLock<redis::Script> =
+                    std::sync::LazyLock::new(|| {
+                        redis::Script::new(include_str!("resurrect_claim.lua"))
+                    });
+                let moved: usize = RESURRECT
+                    .key(&self.keys.jobs)
+                    .key(&processing_queue)
+                    .key(self.namespace_queue(queue))
+                    .arg(&id)
+                    .arg(payload.unwrap_or_default())
+                    .arg(usize::from(should_resurrect))
+                    .invoke_async(&mut *redis)
+                    .await?;
+                resurrected_count += moved;
+                if moved > 0 {
+                    match envelope {
+                        Some(envelope) => tracing::info!(
+                            job_id = id,
+                            queue = envelope.queue,
+                            job = envelope.job.name,
+                            resurrected = should_resurrect,
+                            "Recovered interrupted job"
+                        ),
+                        None => {
+                            tracing::warn!(job_id = id, "Job payload not found during recovery");
                         }
                     }
                 }
             }
 
-            if offset == 0 {
+            if redis.llen::<_, usize>(&processing_queue).await? == 0 {
                 let _: () = redis::pipe()
                     .zrem(&self.keys.processes, &process_id)
                     .hdel(&self.keys.processes_data, &process_id)
