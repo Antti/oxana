@@ -72,11 +72,14 @@ where
     }
 
     tracing::info!("Shutting down");
-    let deadline = tokio::time::Instant::now() + runtime.settings.shutdown_timeout;
+    let deadline = runtime
+        .settings
+        .shutdown_timeout
+        .and_then(|timeout| tokio::time::Instant::now().checked_add(timeout));
     runtime.cancel_token.cancel();
     runtime.tasks.close();
 
-    let drained = tokio::time::timeout_at(deadline, async {
+    let drain = async {
         while let Some(task_result) = coordinator_joinset.join_next().await {
             record_task_result(&runtime, task_result);
         }
@@ -96,8 +99,14 @@ where
         if let Err(error) = runtime.storage.internal.self_cleanup().await {
             runtime.fail(error);
         }
-    })
-    .await;
+    };
+    let drained = match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, drain).await,
+        None => {
+            drain.await;
+            Ok(())
+        }
+    };
 
     if drained.is_err() {
         tracing::error!("Shutdown timeout reached; cancelling remaining owned tasks");

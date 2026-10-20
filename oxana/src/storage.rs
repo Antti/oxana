@@ -803,7 +803,7 @@ mod tests {
             settings.throttled_queue_fallback_wait,
             Duration::from_millis(100)
         );
-        assert_eq!(settings.shutdown_timeout, Duration::from_secs(180));
+        assert_eq!(settings.shutdown_timeout, Some(Duration::from_secs(180)));
         assert_eq!(settings.exit_when_processed, None);
     }
 
@@ -844,7 +844,7 @@ mod tests {
             settings.throttled_queue_fallback_wait,
             Duration::from_millis(22)
         );
-        assert_eq!(settings.shutdown_timeout, Duration::from_millis(23));
+        assert_eq!(settings.shutdown_timeout, Some(Duration::from_millis(23)));
         assert_eq!(settings.exit_when_processed, Some(24));
         assert_eq!(storage.dead_process_threshold(), Duration::from_millis(12));
     }
