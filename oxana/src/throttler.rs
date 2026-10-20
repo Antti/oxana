@@ -44,7 +44,7 @@ impl Throttler {
 
             let mut pipe = redis::pipe();
             pipe.zadd_multiple(&self.key, &members)
-                .expire(&self.key, self.window_s());
+                .pexpire(&self.key, self.window_ms);
             let (updated, _): (u64, ()) = pipe.query_async(&mut redis).await?;
 
             Ok(ThrottlerState {
@@ -102,10 +102,6 @@ impl Throttler {
         format!("oxana:throttler:{key}")
     }
 
-    fn window_s(&self) -> i64 {
-        self.window_ms / 1000
-    }
-
     fn window_micros(&self) -> i64 {
         self.window_ms * 1000
     }
@@ -116,6 +112,29 @@ mod tests {
     use super::*;
     use crate::test_helper::*;
     use testresult::TestResult;
+
+    #[tokio::test]
+    async fn throttle_expiry_preserves_milliseconds() -> TestResult {
+        use deadpool_redis::redis::AsyncCommands;
+
+        let pool = redis_pool().await?;
+        let mut redis = pool.get().await?;
+        for window_ms in [500, 1500] {
+            let throttler = Throttler::new(pool.clone(), &random_string(), 1, window_ms);
+            let before: (i64, i64) = redis::cmd("TIME").query_async(&mut redis).await?;
+            assert!(throttler.consume(None).await?.is_allowed);
+            let ttl: i64 = redis.pttl(&throttler.key).await?;
+            let after: (i64, i64) = redis::cmd("TIME").query_async(&mut redis).await?;
+            let elapsed_ms = after.0 * 1000 + after.1 / 1000 - (before.0 * 1000 + before.1 / 1000);
+
+            assert!(
+                (window_ms - elapsed_ms..=window_ms).contains(&ttl),
+                "expected {window_ms} ms expiry, got {ttl} ms after at most {elapsed_ms} ms"
+            );
+            assert!(!throttler.consume(None).await?.is_allowed);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_consume() -> TestResult {

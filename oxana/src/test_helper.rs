@@ -1,5 +1,9 @@
 use rand::distr::{Alphanumeric, SampleString};
 
+#[path = "../tests/integration/claim_recovery/redis_proxy.rs"]
+#[allow(dead_code)]
+pub(crate) mod redis_proxy;
+
 pub fn random_string() -> String {
     Alphanumeric.sample_string(&mut rand::rng(), 16)
 }
