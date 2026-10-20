@@ -476,6 +476,7 @@ async fn bounded_shutdown<const BATCH: bool>(trigger: ShutdownTrigger) -> TestRe
         .queue_with_concurrency::<QueueTwo>(2)
         .worker::<BlockedShutdownWorker<BATCH>, BlockedShutdownJob>()
         .heartbeat_interval(Duration::from_millis(25))
+        .disable_shutdown_timeout()
         .shutdown_timeout(deadline)
         .redis_failure_tolerance(1)
         .shutdown_on(async move {
@@ -637,6 +638,113 @@ async fn test_shutdown_deadline_preserves_error_with_blocked_batches() -> TestRe
 #[tokio::test]
 async fn test_shutdown_deadline_preserves_background_redis_error() -> TestResult {
     bounded_shutdown::<true>(ShutdownTrigger::BackgroundFailure).await
+}
+
+async fn unbounded_shutdown<const BATCH: bool>(timeout: Option<Duration>) -> TestResult {
+    let pool = setup();
+    let namespace = random_string();
+    let storage = oxana::Storage::builder()
+        .namespace(namespace.clone())
+        .build_from_pool(pool.clone())?;
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let state = BlockedShutdownState {
+        started: started_tx,
+        dropped: dropped_tx,
+        release: Arc::new(tokio::sync::Mutex::new(release_rx)),
+        lifetime: Arc::new(()),
+    };
+    let lifetime = Arc::downgrade(&state.lifetime);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
+    let runtime = storage
+        .runtime(state)
+        .queue_with_concurrency::<QueueOne>(2)
+        .worker::<BlockedShutdownWorker<BATCH>, BlockedShutdownJob>()
+        .heartbeat_interval(Duration::from_millis(25))
+        .shutdown_timeout(Duration::from_millis(25))
+        .shutdown_on(async move {
+            shutdown_rx.await.unwrap();
+            shutdown_started_tx.send(()).unwrap();
+            Ok(())
+        });
+    let runtime = match timeout {
+        Some(timeout) => runtime.shutdown_timeout(timeout),
+        None => runtime.disable_shutdown_timeout(),
+    };
+    let batch_size = if BATCH { 2 } else { 1 };
+    let mut job_ids = Vec::new();
+    for _ in 0..batch_size {
+        job_ids.push(storage.enqueue(QueueOne, BlockedShutdownJob).await?);
+    }
+    let mut runner = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(runtime.run()));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), started_rx.recv()).await?,
+        Some(batch_size)
+    );
+    let mut redis = pool.get().await?;
+    let processes_key = format!("{namespace}:processes");
+    let processes: Vec<(String, f64)> = redis.zrange_withscores(&processes_key, 0, -1).await?;
+    assert_eq!(processes.len(), 1);
+    let (process_id, heartbeat) = &processes[0];
+
+    shutdown_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), shutdown_started_rx).await??;
+    // Wait beyond the timeout that was overridden, without cancelling the
+    // runtime future. Only releasing the worker should let shutdown complete.
+    let outcome = tokio::time::timeout(Duration::from_millis(200), &mut runner).await;
+    assert!(
+        outcome.is_err(),
+        "shutdown ended before release: {outcome:?}"
+    );
+    assert_eq!(
+        dropped_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    );
+    let later: f64 = redis.zscore(&processes_key, process_id).await?;
+    assert!(later > *heartbeat, "heartbeat must continue while draining");
+    let processing_key = format!("{namespace}:processing:{process_id}");
+    let claimed: Vec<String> = redis.lrange(&processing_key, 0, -1).await?;
+    assert_eq!(claimed.len(), job_ids.len());
+    for job_id in &job_ids {
+        assert!(claimed.contains(job_id));
+        assert!(storage.get_job(job_id).await?.is_some());
+    }
+
+    release_tx.send(()).unwrap();
+    let stats = tokio::time::timeout(Duration::from_secs(5), &mut runner).await???;
+    assert_eq!(stats.processed, batch_size as u64);
+    assert_eq!(dropped_rx.try_recv(), Ok(()));
+    assert!(lifetime.upgrade().is_none(), "runtime context leaked");
+    for job_id in &job_ids {
+        assert!(storage.get_job(job_id).await?.is_none());
+    }
+    let remaining_claims: usize = redis.llen(&processing_key).await?;
+    assert_eq!(remaining_claims, 0);
+    assert!(storage.processes().await?.is_empty());
+    assert_eq!(storage.dead_count().await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_shutdown_without_timeout_drains_workers() -> TestResult {
+    unbounded_shutdown::<false>(None).await
+}
+
+#[tokio::test]
+async fn test_shutdown_without_timeout_drains_batches() -> TestResult {
+    unbounded_shutdown::<true>(None).await
+}
+
+#[tokio::test]
+async fn test_shutdown_with_max_duration_drains_workers() -> TestResult {
+    unbounded_shutdown::<false>(Some(Duration::MAX)).await
+}
+
+#[tokio::test]
+async fn test_shutdown_with_max_seconds_drains_batches() -> TestResult {
+    unbounded_shutdown::<true>(Some(Duration::from_secs(u64::MAX))).await
 }
 
 #[tokio::test]
