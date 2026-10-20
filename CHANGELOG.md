@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add `Storage::try_enqueue` for immediate single-job enqueue with `Result<Option<JobId>, OxanaError>`: `Some(id)` for inserts and replacements, `None` for skipped unique duplicates, and `Err` for failures. Existing enqueue APIs keep returning the job ID for skipped duplicates.
 - Add `StorageBuilder::dead_job_limit` to configure dead-job retention across all queues in a namespace. The default remains 1,000 payloads; `None` retains jobs until explicitly revived or removed. Consumers sharing a namespace must use the same setting.
 - Add `RuntimeBuilder::disable_shutdown_timeout` to wait indefinitely for graceful shutdown while keeping heartbeats alive during worker draining. The default remains 180 seconds; a later `shutdown_timeout` call enables the timeout again.
 
