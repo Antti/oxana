@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-10-20
+
 ### Added
 
 - Add `Storage::try_enqueue` for immediate single-job enqueue with `Result<Option<JobId>, OxanaError>`: `Some(id)` for inserts and replacements, `None` for skipped unique duplicates, and `Err` for failures. Existing enqueue APIs keep returning the job ID for skipped duplicates.
