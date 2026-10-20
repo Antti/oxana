@@ -25,6 +25,8 @@ struct FaultState {
     injected: AtomicBool,
     faults: AtomicUsize,
     claims: AtomicUsize,
+    request_bytes: AtomicUsize,
+    response_bytes: AtomicUsize,
     outage: AtomicBool,
     fail_reads: AtomicBool,
     pause_reads: AtomicBool,
@@ -33,6 +35,12 @@ struct FaultState {
 }
 
 impl RedisProxy {
+    pub async fn observe() -> TestResult<Self> {
+        let proxy = Self::start_with_fault(Vec::new(), false, false, false).await?;
+        proxy.fault.fail_reads.store(false, Ordering::SeqCst);
+        Ok(proxy)
+    }
+
     pub async fn start(command_prefix: Vec<String>, disconnect: bool) -> TestResult<Self> {
         Self::start_with_fault(command_prefix, disconnect, false, false).await
     }
@@ -73,6 +81,14 @@ impl RedisProxy {
         self.fault.claims.load(Ordering::SeqCst)
     }
 
+    /// Serialized client requests and Redis replies observed by this proxy.
+    pub fn traffic_bytes(&self) -> (usize, usize) {
+        (
+            self.fault.request_bytes.load(Ordering::SeqCst),
+            self.fault.response_bytes.load(Ordering::SeqCst),
+        )
+    }
+
     pub fn set_outage(&self, outage: bool) {
         self.fault.outage.store(outage, Ordering::SeqCst);
     }
@@ -106,6 +122,8 @@ impl RedisProxy {
             injected: AtomicBool::new(false),
             faults: AtomicUsize::new(0),
             claims: AtomicUsize::new(0),
+            request_bytes: AtomicUsize::new(0),
+            response_bytes: AtomicUsize::new(0),
             outage: AtomicBool::new(false),
             fail_reads: AtomicBool::new(true),
             pause_reads: AtomicBool::new(false),
@@ -155,6 +173,9 @@ async fn forward(
     let mut socket = BufReader::new(socket);
     loop {
         let request = read_frame(&mut socket).await?;
+        fault
+            .request_bytes
+            .fetch_add(request.len(), Ordering::SeqCst);
         if fault.outage.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -174,6 +195,9 @@ async fn forward(
         }
         upstream.get_mut().write_all(&request).await?;
         let response = read_frame(&mut upstream).await?;
+        fault
+            .response_bytes
+            .fetch_add(response.len(), Ordering::SeqCst);
 
         if fault.pause_reads.load(Ordering::SeqCst)
             && command.starts_with(&fault.prefix)

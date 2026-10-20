@@ -23,6 +23,9 @@ use crate::{
 mod queue_stats;
 
 #[cfg(test)]
+mod enqueue_tests;
+
+#[cfg(test)]
 mod transition_tests;
 
 use queue_stats::{aggregate_queue_stats, queue_rate_stats};
@@ -74,16 +77,68 @@ pub(crate) struct StorageInternal {
     dead_job_limit: Option<usize>,
 }
 
-enum JobEnqueueAction {
-    Default,
-    Skip,
-    Replace { existing_queue: String },
-}
-
 #[derive(Clone, Copy)]
 enum JobDestination {
     Queue,
     Schedule,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum EnqueueSnapshotComparison {
+    Exact = 1,
+    Suffix = 2,
+    Prefix = 3,
+}
+
+struct EnqueueSnapshot {
+    expected: String,
+    queue: String,
+    comparison: EnqueueSnapshotComparison,
+}
+
+impl EnqueueSnapshot {
+    fn parse(mut payload: String) -> Result<Self, OxanaError> {
+        // Ignore job arguments while extracting the queue. Redis only compares
+        // original bytes; it never parses or re-encodes the job JSON.
+        #[derive(serde::Deserialize)]
+        struct Queue<'a> {
+            #[serde(borrow)]
+            queue: &'a serde_json::value::RawValue,
+        }
+        let raw: Queue<'_> = serde_json::from_str(&payload)?;
+        let queue = serde_json::from_str(raw.queue.get())?;
+        let offset = raw.queue.get().as_ptr() as usize - payload.as_ptr() as usize;
+        let end = offset + raw.queue.get().len();
+        let key = ",\"queue\":";
+        let start = offset
+            .checked_sub(key.len())
+            .filter(|&start| payload.get(start..offset) == Some(key));
+        let comparison = if let Some(start) = start {
+            // JobEnvelope writes queue between job.args and meta.state. Keep
+            // the smaller side so either can be large without being sent back.
+            if end <= payload.len() - start {
+                // Identical leading bytes end at the same parsed root queue.
+                payload.truncate(end);
+                // Release the unused state capacity retained by truncate.
+                payload.shrink_to_fit();
+                EnqueueSnapshotComparison::Prefix
+            } else {
+                // Starting at this root field leaves one unmatched closing
+                // brace, so valid JSON with this tail has the same root queue.
+                payload = payload.split_off(start);
+                EnqueueSnapshotComparison::Suffix
+            }
+        } else {
+            // Other layouts retain the full-byte comparison as a fallback.
+            EnqueueSnapshotComparison::Exact
+        };
+        Ok(Self {
+            expected: payload,
+            queue,
+            comparison,
+        })
+    }
 }
 
 struct QueueStatsInputs {
@@ -364,26 +419,13 @@ impl StorageInternal {
         envelope: JobEnvelope,
         destination: JobDestination,
     ) -> Result<JobId, OxanaError> {
-        let mut pipe = redis::pipe();
-
-        match self.job_enqueue_action(redis, &envelope).await? {
-            JobEnqueueAction::Skip => {
-                tracing::warn!("Unique job {} already exists, skipping", envelope.id);
-
-                return Ok(envelope.id);
-            }
-            JobEnqueueAction::Replace { existing_queue } => {
-                tracing::warn!("Unique job {} already exists, replacing", envelope.id);
-
-                self.append_replace(&mut pipe, &existing_queue, &envelope, destination)?;
-            }
-            JobEnqueueAction::Default => {
-                self.append_enqueue(&mut pipe, &envelope, destination)?;
-            }
-        }
-
-        let _: () = pipe.query_async(&mut *redis).await?;
-
+        self.enqueue_chunk_w_conn(
+            redis,
+            std::slice::from_ref(&envelope),
+            destination,
+            &mut HashSet::new(),
+        )
+        .await?;
         Ok(envelope.id)
     }
 
@@ -393,164 +435,235 @@ impl StorageInternal {
         envelopes: Vec<JobEnvelope>,
         destination: JobDestination,
     ) -> Result<Vec<JobId>, OxanaError> {
-        let mut job_ids = Vec::with_capacity(envelopes.len());
-        let mut staged_unique_queues: HashMap<JobId, String> = HashMap::new();
-
+        let mut written_unique = HashSet::new();
         for chunk in enqueue_list_chunks(&envelopes) {
+            self.enqueue_chunk_w_conn(redis, chunk, destination, &mut written_unique)
+                .await?;
+        }
+        Ok(envelopes.into_iter().map(|envelope| envelope.id).collect())
+    }
+
+    async fn enqueue_chunk_w_conn(
+        &self,
+        redis: &mut deadpool_redis::Connection,
+        envelopes: &[JobEnvelope],
+        destination: JobDestination,
+        written_unique: &mut HashSet<JobId>,
+    ) -> Result<(), OxanaError> {
+        static ENQUEUE: std::sync::LazyLock<redis::Script> =
+            std::sync::LazyLock::new(|| redis::Script::new(include_str!("enqueue.lua")));
+
+        // Ordinary jobs need no uniqueness check or replacement cleanup.
+        if envelopes.iter().all(|envelope| !envelope.meta.unique) {
             let mut pipe = redis::pipe();
-            let mut has_writes = false;
-
-            for envelope in chunk {
-                let job_id = envelope.id.clone();
-                let action = self
-                    .enqueue_list_action(redis, envelope, &staged_unique_queues)
-                    .await?;
-
-                let wrote = match action {
-                    JobEnqueueAction::Skip => {
-                        tracing::warn!("Unique job {} already exists, skipping", envelope.id);
-                        false
-                    }
-                    JobEnqueueAction::Replace { existing_queue } => {
-                        tracing::warn!("Unique job {} already exists, replacing", envelope.id);
-
-                        self.append_replace(&mut pipe, &existing_queue, envelope, destination)?;
-                        true
-                    }
-                    JobEnqueueAction::Default => {
-                        self.append_enqueue(&mut pipe, envelope, destination)?;
-                        true
-                    }
-                };
-
-                if wrote {
-                    if envelope.meta.unique {
-                        staged_unique_queues.insert(job_id.clone(), envelope.queue.clone());
-                    }
-                    has_writes = true;
-                }
-
-                job_ids.push(job_id);
-            }
-
-            if has_writes {
-                let _: () = pipe.query_async(&mut *redis).await?;
-            }
-        }
-
-        Ok(job_ids)
-    }
-
-    async fn enqueue_list_action(
-        &self,
-        redis: &mut deadpool_redis::Connection,
-        envelope: &JobEnvelope,
-        staged_unique_queues: &HashMap<JobId, String>,
-    ) -> Result<JobEnqueueAction, OxanaError> {
-        if !envelope.meta.unique {
-            return Ok(JobEnqueueAction::Default);
-        }
-
-        let Some(existing_queue) = staged_unique_queues.get(&envelope.id) else {
-            return self.job_enqueue_action(redis, envelope).await;
-        };
-
-        match envelope.meta.on_conflict.as_ref() {
-            Some(JobConflictStrategy::Replace) => Ok(JobEnqueueAction::Replace {
-                existing_queue: existing_queue.clone(),
-            }),
-            Some(JobConflictStrategy::Skip) | None => Ok(JobEnqueueAction::Skip),
-        }
-    }
-
-    fn append_enqueue(
-        &self,
-        pipe: &mut redis::Pipeline,
-        envelope: &JobEnvelope,
-        destination: JobDestination,
-    ) -> Result<(), OxanaError> {
-        pipe.hset(
-            &self.keys.jobs,
-            &envelope.id,
-            serde_json::to_string(envelope)?,
-        );
-        self.push_to_destination(pipe, envelope, destination);
-        Ok(())
-    }
-
-    fn push_to_destination(
-        &self,
-        pipe: &mut redis::Pipeline,
-        envelope: &JobEnvelope,
-        destination: JobDestination,
-    ) {
-        match destination {
-            JobDestination::Queue => {
-                pipe.lpush(self.namespace_queue(&envelope.queue), &envelope.id);
-            }
-            JobDestination::Schedule => {
-                pipe.zadd(
-                    &self.keys.schedule,
+            for envelope in envelopes {
+                pipe.hset(
+                    &self.keys.jobs,
                     &envelope.id,
-                    envelope.meta.scheduled_at,
+                    serde_json::to_string(envelope)?,
                 );
-            }
-        }
-    }
-
-    async fn job_enqueue_action(
-        &self,
-        redis: &mut deadpool_redis::Connection,
-        envelope: &JobEnvelope,
-    ) -> Result<JobEnqueueAction, OxanaError> {
-        if !envelope.meta.unique {
-            return Ok(JobEnqueueAction::Default);
-        }
-
-        let exists: bool = redis.hexists(&self.keys.jobs, &envelope.id).await?;
-
-        if exists {
-            match envelope.meta.on_conflict {
-                Some(JobConflictStrategy::Skip) | None => Ok(JobEnqueueAction::Skip),
-                Some(JobConflictStrategy::Replace) => {
-                    match self.get_job_w_conn(redis, &envelope.id).await? {
-                        Some(existing) => Ok(JobEnqueueAction::Replace {
-                            existing_queue: existing.queue,
-                        }),
-                        None => Ok(JobEnqueueAction::Default),
+                match destination {
+                    JobDestination::Queue => {
+                        pipe.lpush(self.namespace_queue(&envelope.queue), &envelope.id);
+                    }
+                    JobDestination::Schedule => {
+                        pipe.zadd(
+                            &self.keys.schedule,
+                            &envelope.id,
+                            envelope.meta.scheduled_at,
+                        );
                     }
                 }
             }
-        } else {
-            Ok(JobEnqueueAction::Default)
-        }
-    }
-
-    fn append_replace(
-        &self,
-        pipe: &mut redis::Pipeline,
-        existing_queue: &str,
-        envelope: &JobEnvelope,
-        destination: JobDestination,
-    ) -> Result<(), OxanaError> {
-        let old_queue = self.namespace_queue(existing_queue);
-
-        pipe.hset(
-            &self.keys.jobs,
-            &envelope.id,
-            serde_json::to_string(envelope)?,
-        )
-        .zrem(&self.keys.schedule, &envelope.id)
-        .zrem(&self.keys.retry, &envelope.id)
-        .lrem(old_queue, 0, &envelope.id);
-
-        if existing_queue != envelope.queue.as_str() {
-            pipe.lrem(self.namespace_queue(&envelope.queue), 0, &envelope.id);
+            pipe.query_async::<()>(redis).await?;
+            return Ok(());
         }
 
-        self.push_to_destination(pipe, envelope, destination);
+        // Retain request-wide Skip semantics even if a worker finishes a job
+        // between chunks. Within an atomic chunk, an earlier occurrence always
+        // leaves the ID present, so later Skip occurrences can also be omitted.
+        let mut seen = HashSet::new();
+        let pending: Vec<_> = envelopes
+            .iter()
+            .filter(|envelope| {
+                if envelope.meta.unique
+                    && envelope.meta.on_conflict != Some(JobConflictStrategy::Replace)
+                    && (written_unique.contains(&envelope.id) || seen.contains(&envelope.id))
+                {
+                    tracing::warn!(
+                        "Unique job {} already enqueued in this request, skipping",
+                        envelope.id
+                    );
+                    false
+                } else {
+                    seen.insert(&envelope.id);
+                    true
+                }
+            })
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
 
-        Ok(())
+        // A preceding unconditional write supplies the queue for later
+        // replacements. Otherwise snapshot each replaced ID just once.
+        let mut overwritten = HashSet::new();
+        let mut replacement_ids = HashSet::new();
+        for envelope in &pending {
+            if (!envelope.meta.unique
+                || envelope.meta.on_conflict == Some(JobConflictStrategy::Replace))
+                && overwritten.insert(&envelope.id)
+                && envelope.meta.unique
+            {
+                replacement_ids.insert(envelope.id.clone());
+            }
+        }
+        let mut snapshots = HashMap::new();
+        if !replacement_ids.is_empty() {
+            let ids: Vec<_> = replacement_ids.into_iter().collect();
+            let payloads: Vec<Option<String>> = redis::cmd("HMGET")
+                .arg(&self.keys.jobs)
+                .arg(&ids)
+                .query_async(redis)
+                .await?;
+            for (id, payload) in ids.into_iter().zip(payloads) {
+                snapshots.insert(id, payload.map(EnqueueSnapshot::parse).transpose()?);
+            }
+        }
+
+        // Resolve existing Skip jobs before serializing their incoming payloads.
+        // A missing ID is checked again by Lua, atomically with insertion.
+        let mut existing_skips = HashSet::new();
+        let mut skip_ids = Vec::new();
+        let mut existence = redis::pipe();
+        for envelope in &pending {
+            if envelope.meta.unique
+                && envelope.meta.on_conflict != Some(JobConflictStrategy::Replace)
+            {
+                if let Some(snapshot) = snapshots.get(&envelope.id) {
+                    if snapshot.is_some() {
+                        existing_skips.insert(&envelope.id);
+                    }
+                } else {
+                    skip_ids.push(&envelope.id);
+                    existence.hexists(&self.keys.jobs, &envelope.id);
+                }
+            }
+        }
+        if !skip_ids.is_empty() {
+            let exists: Vec<bool> = existence.query_async(redis).await?;
+            for (id, exists) in skip_ids.into_iter().zip(exists) {
+                if exists {
+                    existing_skips.insert(id);
+                }
+            }
+        }
+        let pending: Vec<_> = pending
+            .into_iter()
+            .filter(|envelope| {
+                let skip = envelope.meta.unique
+                    && envelope.meta.on_conflict != Some(JobConflictStrategy::Replace)
+                    && existing_skips.contains(&envelope.id);
+                if skip {
+                    tracing::warn!("Unique job {} already exists, skipping", envelope.id);
+                }
+                !skip
+            })
+            .map(|envelope| serde_json::to_string(envelope).map(|payload| (envelope, payload)))
+            .collect::<Result<_, _>>()?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        loop {
+            let mut invocation = ENQUEUE.prepare_invoke();
+            invocation
+                .key(&self.keys.jobs)
+                .key(&self.keys.schedule)
+                .key(&self.keys.retry);
+            // Every old and new queue is declared through KEYS, even on retry.
+            let mut queues = HashMap::new();
+            for queue in pending
+                .iter()
+                .map(|(envelope, _)| envelope.queue.as_str())
+                .chain(
+                    snapshots
+                        .values()
+                        .flatten()
+                        .map(|snapshot| snapshot.queue.as_str()),
+                )
+            {
+                let index = queues.len() + 4;
+                queues.entry(queue).or_insert_with(|| {
+                    invocation.key(self.namespace_queue(queue));
+                    index
+                });
+            }
+            invocation
+                .arg(match destination {
+                    JobDestination::Queue => "queue",
+                    JobDestination::Schedule => "schedule",
+                })
+                .arg(snapshots.len());
+            for (id, snapshot) in &snapshots {
+                invocation.arg(id);
+                if let Some(snapshot) = snapshot {
+                    invocation
+                        .arg(snapshot.comparison as u8)
+                        .arg(&snapshot.expected)
+                        .arg(
+                            queues
+                                .get(snapshot.queue.as_str())
+                                .expect("snapshot queue was declared"),
+                        );
+                } else {
+                    invocation.arg(0).arg("").arg(0);
+                }
+            }
+            for (envelope, payload) in &pending {
+                let conflict = if !envelope.meta.unique {
+                    "default"
+                } else if envelope.meta.on_conflict == Some(JobConflictStrategy::Replace) {
+                    "replace"
+                } else {
+                    "skip"
+                };
+                invocation
+                    .arg(&envelope.id)
+                    .arg(payload)
+                    .arg(
+                        queues
+                            .get(envelope.queue.as_str())
+                            .expect("destination queue was declared"),
+                    )
+                    .arg(conflict)
+                    .arg(envelope.meta.scheduled_at);
+            }
+
+            let (changed, outcomes): (Vec<(JobId, Option<String>)>, Vec<u8>) =
+                invocation.invoke_async(&mut *redis).await?;
+            if changed.is_empty() {
+                for ((envelope, _), outcome) in pending.iter().zip(outcomes) {
+                    if outcome == 0 {
+                        tracing::warn!("Unique job {} already exists, skipping", envelope.id);
+                    } else {
+                        if outcome == 2 {
+                            tracing::warn!("Unique job {} already exists, replacing", envelope.id);
+                        }
+                        if envelope.meta.unique {
+                            written_unique.insert(envelope.id.clone());
+                        }
+                    }
+                }
+                return Ok(());
+            }
+
+            // No writes occurred. Parse the changed snapshots outside Redis and
+            // retry without an arbitrary contention limit or another read trip.
+            for (id, payload) in changed {
+                snapshots.insert(id, payload.map(EnqueueSnapshot::parse).transpose()?);
+            }
+        }
     }
 
     pub async fn enqueue_in(
