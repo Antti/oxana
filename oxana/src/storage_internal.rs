@@ -400,6 +400,23 @@ impl StorageInternal {
             .await
     }
 
+    pub async fn try_enqueue(&self, envelope: JobEnvelope) -> Result<Option<JobId>, OxanaError> {
+        let mut redis = self.connection().await?;
+        let mut written_unique = HashSet::new();
+        self.enqueue_chunk_w_conn(
+            &mut redis,
+            std::slice::from_ref(&envelope),
+            JobDestination::Queue,
+            &mut written_unique,
+        )
+        .await?;
+
+        // Unique IDs are recorded only when the atomic enqueue actually writes.
+        // Ordinary jobs always write; neither path needs a follow-up Redis read.
+        let written = !envelope.meta.unique || written_unique.contains(&envelope.id);
+        Ok(written.then_some(envelope.id))
+    }
+
     pub async fn enqueue_list(
         &self,
         envelopes: Vec<JobEnvelope>,

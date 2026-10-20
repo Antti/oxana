@@ -339,6 +339,93 @@ async fn skip_rechecks_absence_before_inserting() -> TestResult {
 }
 
 #[tokio::test]
+async fn try_enqueue_reports_skip_when_another_producer_wins_after_preflight() -> TestResult {
+    let (storage, original) = fixture(JobConflictStrategy::Skip).await?;
+    let proxy = RedisProxy::pause_once(vec!["HEXISTS".into(), storage.keys.jobs.clone()]).await?;
+    let mut through_proxy = storage.clone();
+    through_proxy.pool = proxy.pool.clone();
+    let incoming = original.clone();
+    let enqueue = tokio::spawn(async move { through_proxy.try_enqueue(incoming).await });
+    tokio::time::timeout(Duration::from_secs(5), proxy.wait_until_paused()).await?;
+
+    let mut winner = original.clone();
+    winner.job.args = serde_json::json!({"producer": "winner"});
+    storage.enqueue(winner.clone()).await?;
+    proxy.resume();
+
+    assert_eq!(enqueue.await??, None);
+    assert_eq!(storage.enqueued_count(&original.queue).await?, 1);
+    assert_eq!(
+        storage.get_job(&original.id).await?.unwrap().job.args,
+        winner.job.args
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn try_enqueue_preserves_skip_after_the_existing_job_finishes() -> TestResult {
+    let (storage, original) = fixture(JobConflictStrategy::Skip).await?;
+    storage.enqueue(original.clone()).await?;
+    let proxy = RedisProxy::pause_once(vec!["HEXISTS".into(), storage.keys.jobs.clone()]).await?;
+    let mut through_proxy = storage.clone();
+    through_proxy.pool = proxy.pool.clone();
+    let incoming = original.clone();
+    let enqueue = tokio::spawn(async move { through_proxy.try_enqueue(incoming).await });
+    tokio::time::timeout(Duration::from_secs(5), proxy.wait_until_paused()).await?;
+
+    assert_eq!(
+        storage.dequeue(&original.queue).await?,
+        Some(original.id.clone())
+    );
+    storage.finish_with_success(&original).await?;
+    proxy.resume();
+
+    assert_eq!(enqueue.await??, None);
+    assert!(storage.get_job(&original.id).await?.is_none());
+    assert_eq!(storage.enqueued_count(&original.queue).await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn try_enqueue_preserves_success_after_the_written_job_finishes() -> TestResult {
+    for strategy in [
+        None,
+        Some(JobConflictStrategy::Skip),
+        Some(JobConflictStrategy::Replace),
+    ] {
+        let (storage, mut original) = fixture(JobConflictStrategy::Skip).await?;
+        original.meta.unique = strategy.is_some();
+        original.meta.on_conflict.clone_from(&strategy);
+        if strategy == Some(JobConflictStrategy::Replace) {
+            storage.enqueue(original.clone()).await?;
+        }
+        let prefix = if original.meta.unique {
+            enqueue_script_prefix(&storage).await?
+        } else {
+            vec!["LPUSH".into(), storage.namespace_queue(&original.queue)]
+        };
+        let proxy = RedisProxy::pause_once(prefix).await?;
+        let mut through_proxy = storage.clone();
+        through_proxy.pool = proxy.pool.clone();
+        let incoming = original.clone();
+        let enqueue = tokio::spawn(async move { through_proxy.try_enqueue(incoming).await });
+        tokio::time::timeout(Duration::from_secs(5), proxy.wait_until_paused()).await?;
+
+        assert_eq!(
+            storage.dequeue(&original.queue).await?,
+            Some(original.id.clone())
+        );
+        storage.finish_with_success(&original).await?;
+        proxy.resume();
+
+        assert_eq!(enqueue.await??, Some(original.id.clone()));
+        assert!(storage.get_job(&original.id).await?.is_none());
+        assert_eq!(storage.enqueued_count(&original.queue).await?, 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn concurrent_unique_replace_keeps_the_last_payload_of_one_batch() -> TestResult {
     let (storage, envelope) = fixture(JobConflictStrategy::Replace).await?;
     let barrier = Arc::new(tokio::sync::Barrier::new(24));
