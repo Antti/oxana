@@ -246,14 +246,20 @@ where
 
             let err_msg = config.settings.format_error(e.as_ref());
             for (envelope, policy) in envelopes.iter().zip(policies.iter()) {
-                handle_err(
+                if let Err(error) = handle_err(
                     config,
                     &err_msg,
                     envelope,
                     retry_delay(config, e.as_ref(), envelope, policy),
                     policy.max_retries,
                 )
-                .await;
+                .await
+                {
+                    // Leave remaining claims for recovery instead of spending
+                    // another connection retry window on every job in the batch.
+                    config.fail(error);
+                    break;
+                }
             }
 
             WorkerResultKind::Failed
@@ -271,14 +277,18 @@ where
             );
 
             for (envelope, policy) in envelopes.iter().zip(policies.iter()) {
-                handle_err(
+                if let Err(error) = handle_err(
                     config,
                     &panic_msg,
                     envelope,
                     policy.retry_delay,
                     policy.max_retries,
                 )
-                .await;
+                .await
+                {
+                    config.fail(error);
+                    break;
+                }
             }
 
             WorkerResultKind::Panicked
@@ -385,19 +395,16 @@ async fn handle_err<DT>(
     envelope: &JobEnvelope,
     retry_delay: u64,
     max_retries: u32,
-) where
+) -> Result<(), OxanaError>
+where
     DT: Send + Sync + Clone + 'static,
 {
     if envelope.meta.retries < max_retries {
-        if let Err(e) = config
+        config
             .storage
             .internal
             .retry_in(envelope.id.clone(), retry_delay, err_msg.to_string())
             .await
-        {
-            // A live heartbeat would otherwise keep the abandoned claim unrecoverable.
-            config.fail(e);
-        }
     } else {
         tracing::error!(
             "Job {} failed after {} retries: {}",
@@ -405,13 +412,10 @@ async fn handle_err<DT>(
             max_retries,
             err_msg
         );
-        if let Err(e) = config
+        config
             .storage
             .internal
             .kill(envelope, err_msg.to_string())
             .await
-        {
-            config.fail(e);
-        }
     }
 }

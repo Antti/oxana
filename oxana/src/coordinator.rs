@@ -20,6 +20,9 @@ use crate::{
     result_collector::{self, Stats},
 };
 
+#[cfg(test)]
+mod connection_tests;
+
 pub async fn run<DT>(
     config: Arc<Runtime<DT>>,
     stats: Arc<Mutex<Stats>>,

@@ -329,7 +329,10 @@ where
     ///
     /// After a transient payload-read failure, preparation retries for up to
     /// five seconds with backoff and jitter, retaining the claim and concurrency
-    /// permit. Other preparation failures, exhausted read retries, and uncertain
+    /// permit. Connection acquisition for job start, acknowledgment, retry and
+    /// dead-letter transitions retries for up to two seconds after the first
+    /// transient failure. Transition commands that may have been sent are not replayed.
+    /// Other preparation failures, exhausted retries, and uncertain
     /// claims initiate shutdown regardless of this threshold. Redis may already
     /// hold the claim, and a live runtime's heartbeat prevents its recovery.
     /// Shutdown drains active handlers before stopping heartbeats; a peer or
