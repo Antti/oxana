@@ -1,10 +1,5 @@
-#[path = "../../tests/integration/claim_recovery/redis_proxy.rs"]
-#[allow(dead_code)]
-mod redis_proxy;
-
 use super::*;
-use crate::test_helper::{random_string, redis_pool};
-use redis_proxy::RedisProxy;
+use crate::test_helper::{random_string, redis_pool, redis_proxy::RedisProxy};
 use testresult::TestResult;
 
 #[derive(serde::Serialize)]

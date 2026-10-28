@@ -165,12 +165,29 @@ where
     /// Sets one deadline for draining workers, joining background tasks, and
     /// removing the process registration during shutdown, shared by all queues.
     ///
+    /// Defaults to 180 seconds. Calling this after
+    /// [`Self::disable_shutdown_timeout`] enables the timeout again. A duration
+    /// that overflows the shutdown deadline is treated as no deadline.
+    ///
     /// At the deadline, remaining owned asynchronous tasks are cancelled and
     /// joined. Interrupted jobs remain available to the resurrection mechanism.
     /// [`Self::run`] returns [`OxanaError::ShutdownTimeout`] after an ordinary
     /// shutdown signal, or the initiating error if a task failure caused shutdown.
     pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
-        self.settings.shutdown_timeout = timeout;
+        self.settings.shutdown_timeout = Some(timeout);
+        self
+    }
+
+    /// Disables the shutdown deadline, waiting indefinitely for workers and
+    /// background tasks to finish before removing the process registration.
+    ///
+    /// Shutdown still stops new work, and heartbeats continue while workers
+    /// drain. If a worker never finishes, shutdown keeps waiting.
+    ///
+    /// Overrides any earlier [`Self::shutdown_timeout`] call. Calling
+    /// `shutdown_timeout` afterward enables the timeout again.
+    pub fn disable_shutdown_timeout(mut self) -> Self {
+        self.settings.shutdown_timeout = None;
         self
     }
 

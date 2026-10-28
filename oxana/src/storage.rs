@@ -118,6 +118,9 @@ impl Storage {
     /// # Returns
     ///
     /// A [`JobId`] that can be used to track the job, or an [`OxanaError`] if the operation fails.
+    /// Skipped unique jobs also return their existing ID. Use
+    /// [`try_enqueue`](Self::try_enqueue) to distinguish a skip from an insert
+    /// or replacement.
     ///
     /// # Examples
     ///
@@ -135,6 +138,30 @@ impl Storage {
         job: T,
     ) -> Result<JobId, OxanaError> {
         self.enqueue_in(queue, job, 0).await
+    }
+
+    /// Enqueues a job for immediate processing and reports whether it was written.
+    ///
+    /// Uses the same uniqueness and conflict rules as [`enqueue`](Self::enqueue).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(job_id))` when the job was inserted or replaced an existing job
+    ///   using [`JobConflictStrategy::Replace`](crate::JobConflictStrategy::Replace).
+    /// - `Ok(None)` when an existing unique job caused the attempt to be skipped
+    ///   using [`JobConflictStrategy::Skip`](crate::JobConflictStrategy::Skip).
+    /// - `Err(error)` when serialization or a storage operation fails.
+    ///
+    /// The result describes this enqueue attempt, not whether the job is still
+    /// pending when the call returns. A worker may already have processed it.
+    pub async fn try_enqueue<T: Job + 'static>(
+        &self,
+        queue: impl Queue,
+        job: T,
+    ) -> Result<Option<JobId>, OxanaError> {
+        let envelope = JobEnvelope::new(queue.key(), job)?;
+        tracing::trace!("Enqueuing job: {:?}", envelope);
+        self.internal.try_enqueue(envelope).await
     }
 
     /// Enqueues multiple jobs to the same queue for immediate processing.
@@ -803,7 +830,7 @@ mod tests {
             settings.throttled_queue_fallback_wait,
             Duration::from_millis(100)
         );
-        assert_eq!(settings.shutdown_timeout, Duration::from_secs(180));
+        assert_eq!(settings.shutdown_timeout, Some(Duration::from_secs(180)));
         assert_eq!(settings.exit_when_processed, None);
     }
 
@@ -844,7 +871,7 @@ mod tests {
             settings.throttled_queue_fallback_wait,
             Duration::from_millis(22)
         );
-        assert_eq!(settings.shutdown_timeout, Duration::from_millis(23));
+        assert_eq!(settings.shutdown_timeout, Some(Duration::from_millis(23)));
         assert_eq!(settings.exit_when_processed, Some(24));
         assert_eq!(storage.dead_process_threshold(), Duration::from_millis(12));
     }

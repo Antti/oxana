@@ -29,7 +29,7 @@ type ShutdownSignal =
 pub(crate) struct RuntimeSettings {
     pub(crate) exit_when_processed: Option<u64>,
     shutdown_signal: Arc<Mutex<Option<ShutdownSignal>>>,
-    pub(crate) shutdown_timeout: Duration,
+    pub(crate) shutdown_timeout: Option<Duration>,
     pub(crate) retry_delay_override: Option<Arc<RetryDelayOverrideFn>>,
     pub(crate) error_formatter: Option<Arc<ErrorFormatterFn>>,
     pub(crate) failure_reporter: Option<Arc<FailureReporterFn>>,
@@ -56,7 +56,7 @@ impl RuntimeSettings {
         Self {
             exit_when_processed: None,
             shutdown_signal: Arc::new(Mutex::new(Some(Box::pin(default_shutdown_signal())))),
-            shutdown_timeout: Duration::from_secs(180),
+            shutdown_timeout: Some(Duration::from_secs(180)),
             retry_delay_override: None,
             error_formatter: None,
             failure_reporter: None,

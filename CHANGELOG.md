@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-10-20
+
+### Added
+
+- Add `Storage::try_enqueue` for immediate single-job enqueue with `Result<Option<JobId>, OxanaError>`: `Some(id)` for inserts and replacements, `None` for skipped unique duplicates, and `Err` for failures. Existing enqueue APIs keep returning the job ID for skipped duplicates.
+- Add `StorageBuilder::dead_job_limit` to configure dead-job retention across all queues in a namespace. The default remains 1,000 payloads; `None` retains jobs until explicitly revived or removed. Consumers sharing a namespace must use the same setting.
+- Add `RuntimeBuilder::disable_shutdown_timeout` to wait indefinitely for graceful shutdown while keeping heartbeats alive during worker draining. The default remains 180 seconds; a later `shutdown_timeout` call enables the timeout again.
+
+### Fixed
+
+- Keep jobs recoverable after Redis claim or preparation errors before execution. Retry transient payload reads for up to five seconds; uncertain claims and unrecoverable preparation errors trigger graceful shutdown so a peer or replacement runtime can recover retained claims.
+- Preserve failed jobs during retry and dead-queue transitions by saving their destination before releasing the processing claim. Stop the runtime on transition errors so retained claims can recover.
+- Atomically promote scheduled and retry jobs and recover dead-worker claims, using snapshot checks to prevent stale or concurrent moves. Missing or malformed payloads no longer block unrelated jobs.
+- Acknowledge successful jobs atomically and shut down on acknowledgment errors so retained claims can recover instead of remaining stuck behind a live heartbeat. Execution remains at least once.
+- Honor configured dead-job retention when draining queues, including unlimited retention.
+- Atomically insert or replace unique jobs for immediate and scheduled enqueue, including bulk writes in chunks of up to 100 jobs, preventing concurrent producers from duplicating jobs or leaving stale queue entries. Existing-job skips can be decided before the writes, and bulk calls are not all-or-nothing.
+- Preserve millisecond precision in throttle expiry, including windows shorter than one second.
+- Treat shutdown durations that overflow the deadline, including `Duration::MAX`, as unlimited instead of panicking at shutdown.
+
 ## [2.3.0] - 2026-09-25
 
 ### Breaking changes
