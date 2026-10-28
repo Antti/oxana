@@ -184,6 +184,29 @@ Build it with `Storage::from_env()` or `Storage::builder().build_from_env()`, wh
 Set `REDIS_STATS_URL` to store counters and metrics in a separate Redis instance; when it is not set, stats use `REDIS_URL`.
 Call `storage.runtime(ctx)` to create a typed worker runtime, register queues and workers on that runtime, then call `runtime.run().await`.
 
+Pool acquisition retries are disabled by default. Enable them when short Redis
+stalls should delay an operation instead of immediately returning an error:
+
+```rust
+use std::time::Duration;
+use oxana::{PoolRetryConfig, Storage};
+
+let storage = Storage::builder()
+    .pool_retries(Some(PoolRetryConfig {
+        retry_window: Duration::from_secs(5),
+        initial_backoff: Duration::from_millis(100),
+        max_backoff: Duration::from_secs(1),
+    }))
+    .build_from_env()?;
+```
+
+The window starts after the first failed checkout and includes all subsequent
+attempts and delays. Backoff doubles up to its maximum, with each delay randomly
+selected between half and all of that ceiling. Permanent errors fail immediately;
+only acquiring a connection is retried, never the caller's queue command.
+The policy also applies to supplied pools and statistics pools. Pass `None` to
+disable retries. Pool create/recycle deadlines remain configured by `timeouts`.
+
 ### Context
 
 The context provides shared state and utilities to workers. It can include:

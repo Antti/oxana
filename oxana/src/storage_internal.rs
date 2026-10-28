@@ -9,7 +9,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    OxanaError,
+    OxanaError, PoolRetryConfig,
     job_envelope::{JobConflictStrategy, JobEnvelope, JobId},
     metrics::*,
     queue::{QueueRuntimeConfig, QueueState},
@@ -71,6 +71,7 @@ fn enqueue_list_chunks(envelopes: &[JobEnvelope]) -> std::slice::Chunks<'_, JobE
 pub(crate) struct StorageInternal {
     pool: deadpool_redis::Pool,
     stats_pool: Option<deadpool_redis::Pool>,
+    pool_retries: Option<PoolRetryConfig>,
     keys: StorageKeys,
     started_at: i64,
     instance_id: String,
@@ -149,6 +150,11 @@ struct QueueStatsInputs {
 }
 
 impl StorageInternal {
+    pub(crate) fn with_pool_retries(mut self, config: Option<PoolRetryConfig>) -> Self {
+        self.pool_retries = config;
+        self
+    }
+
     pub(crate) fn with_dead_job_limit(mut self, limit: Option<usize>) -> Self {
         self.dead_job_limit = limit;
         self
@@ -175,6 +181,7 @@ impl StorageInternal {
         Self {
             pool,
             stats_pool,
+            pool_retries: None,
             keys,
             started_at: chrono::Utc::now().timestamp(),
             instance_id: uuid::Uuid::new_v4().simple().to_string(),
@@ -191,6 +198,7 @@ impl StorageInternal {
             Some(self.keys.namespace.clone()),
         )
         .with_dead_job_limit(self.dead_job_limit)
+        .with_pool_retries(self.pool_retries)
     }
 
     fn record_redis_success(&self) {
@@ -245,18 +253,19 @@ impl StorageInternal {
     }
 
     pub async fn connection(&self) -> Result<deadpool_redis::Connection, OxanaError> {
-        Self::connection_from_pool(&self.pool).await
+        self.connection_from_pool(&self.pool).await
     }
 
     async fn stats_connection(&self) -> Result<deadpool_redis::Connection, OxanaError> {
         let pool = self.stats_pool.as_ref().unwrap_or(&self.pool);
-        Self::connection_from_pool(pool).await
+        self.connection_from_pool(pool).await
     }
 
     async fn connection_from_pool(
+        &self,
         pool: &deadpool_redis::Pool,
     ) -> Result<deadpool_redis::Connection, OxanaError> {
-        connection::get(pool).await
+        connection::get(pool, self.pool_retries).await
     }
 
     async fn scan_keys_w_conn(

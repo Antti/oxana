@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::{OxanaError, Storage, storage_internal::StorageInternal};
+use crate::{OxanaError, PoolRetryConfig, Storage, storage_internal::StorageInternal};
 
 const DEFAULT_REDIS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -9,6 +9,7 @@ pub struct StorageBuilder {
     namespace: Option<String>,
     max_pool_size: Option<usize>,
     timeouts: Option<StorageBuilderTimeouts>,
+    pool_retries: Option<PoolRetryConfig>,
     redis_response_timeout: Option<Duration>,
     dead_job_limit: Option<std::num::NonZeroUsize>,
 }
@@ -62,6 +63,7 @@ impl StorageBuilder {
             namespace: None,
             max_pool_size: None,
             timeouts: None,
+            pool_retries: None,
             redis_response_timeout: None,
             dead_job_limit: std::num::NonZeroUsize::new(1000),
         }
@@ -86,11 +88,21 @@ impl StorageBuilder {
         self
     }
 
-    /// Sets the deadlines for each pool checkout attempt. Transient checkout
-    /// failures are retried for up to five additional seconds before returning
-    /// an error; queue commands are not replayed by this retry policy.
+    /// Sets the deadlines for each pool checkout attempt.
     pub fn timeouts(mut self, timeouts: StorageBuilderTimeouts) -> Self {
         self.timeouts = Some(timeouts);
+        self
+    }
+
+    /// Retries transient pool acquisition failures before sending queue commands.
+    /// Disabled by default; `None` disables a previously configured policy.
+    /// Applies to primary and statistics pools, including supplied pools.
+    ///
+    /// The retry window starts after the first failed acquisition and bounds
+    /// both backoff and subsequent attempts. Permanent errors fail immediately.
+    /// Invalid durations are rejected when building the storage.
+    pub fn pool_retries(mut self, config: Option<PoolRetryConfig>) -> Self {
+        self.pool_retries = config;
         self
     }
 
@@ -108,10 +120,7 @@ impl StorageBuilder {
                 .unwrap_or(DEFAULT_REDIS_RESPONSE_TIMEOUT),
         )?;
 
-        Ok(Storage::new(
-            StorageInternal::new(pool, self.namespace)
-                .with_dead_job_limit(self.dead_job_limit.map(std::num::NonZeroUsize::get)),
-        ))
+        self.build_from_pool(pool)
     }
 
     pub fn build_from_redis_urls(
@@ -128,10 +137,7 @@ impl StorageBuilder {
         let stats_pool =
             Self::build_redis_pool(stats_url, max_pool_size, timeouts, redis_response_timeout)?;
 
-        Ok(Storage::new(
-            StorageInternal::with_stats_pool(pool, stats_pool, self.namespace)
-                .with_dead_job_limit(self.dead_job_limit.map(std::num::NonZeroUsize::get)),
-        ))
+        self.build_from_pools(pool, stats_pool)
     }
 
     fn build_redis_pool(
@@ -184,7 +190,11 @@ impl StorageBuilder {
     /// `redis_response_timeout` settings do not apply here — the provided pool
     /// is used as-is.
     pub fn build_from_pool(self, pool: deadpool_redis::Pool) -> Result<Storage, OxanaError> {
+        if let Some(config) = self.pool_retries {
+            config.validate()?;
+        }
         let internal = StorageInternal::new(pool, self.namespace)
+            .with_pool_retries(self.pool_retries)
             .with_dead_job_limit(self.dead_job_limit.map(std::num::NonZeroUsize::get));
         Ok(Storage::new(internal))
     }
@@ -199,7 +209,11 @@ impl StorageBuilder {
         pool: deadpool_redis::Pool,
         stats_pool: deadpool_redis::Pool,
     ) -> Result<Storage, OxanaError> {
+        if let Some(config) = self.pool_retries {
+            config.validate()?;
+        }
         let internal = StorageInternal::with_stats_pool(pool, stats_pool, self.namespace)
+            .with_pool_retries(self.pool_retries)
             .with_dead_job_limit(self.dead_job_limit.map(std::num::NonZeroUsize::get));
         Ok(Storage::new(internal))
     }

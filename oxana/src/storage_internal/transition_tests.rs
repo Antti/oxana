@@ -24,6 +24,7 @@ async fn completion_recovers_from_a_connection_setup_failure_without_losing_the_
     let proxy = RedisProxy::start(vec!["CLIENT".into(), "SETINFO".into()], true).await?;
     let mut through_proxy = storage.clone();
     through_proxy.pool = proxy.pool.clone();
+    through_proxy = through_proxy.with_pool_retries(Some(PoolRetryConfig::default()));
 
     through_proxy.finish_with_success(&envelope).await?;
 
