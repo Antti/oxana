@@ -38,7 +38,7 @@ const SCAN_BATCH_SIZE: usize = 500;
 const STATS_READ_BATCH_SIZE: usize = 500;
 const ENQUEUE_LIST_CHUNK_SIZE: usize = 100;
 const CLAIMED_JOB_READ_RETRY_WINDOW: Duration = Duration::from_secs(5);
-const CLAIMED_CONNECTION_RETRY_WINDOW: Duration = Duration::from_secs(2);
+const MIN_CLAIMED_CONNECTION_RETRY_WINDOW: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq, Eq)]
 enum UniqueCronAction {
@@ -264,14 +264,24 @@ impl StorageInternal {
 
     /// Retry acquisition only, before sending a claimed-job transition. Once a
     /// command is sent its result may be ambiguous, so callers must not replay it.
-    /// The bounded window starts after the first failure and does not use the
-    /// shared failure counter, which successful heartbeats can reset.
+    /// The window starts after the first failure and is at least two seconds or
+    /// twice the longest configured pool timeout, whichever is greater. Unset
+    /// timeouts do not extend it. It does not use the shared failure counter,
+    /// which successful heartbeats can reset.
     async fn claimed_connection(
         &self,
         operation: &'static str,
     ) -> Result<deadpool_redis::Connection, OxanaError> {
         let mut result = self.pool.get().await;
-        let deadline = tokio::time::Instant::now() + CLAIMED_CONNECTION_RETRY_WINDOW;
+        let retry_started = tokio::time::Instant::now();
+        let timeouts = self.pool.timeouts();
+        let retry_window = [timeouts.wait, timeouts.create, timeouts.recycle]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or_default()
+            .saturating_mul(2)
+            .max(MIN_CLAIMED_CONNECTION_RETRY_WINDOW);
         let mut backoff_ms = 100_u64;
         loop {
             let error = match result {
@@ -296,10 +306,13 @@ impl StorageInternal {
                 retry_in_ms = delay_ms,
                 "Retrying claimed job Redis connection"
             );
-            result = match tokio::time::timeout_at(deadline, async {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                self.pool.get().await
-            })
+            result = match tokio::time::timeout(
+                retry_window.saturating_sub(retry_started.elapsed()),
+                async {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    self.pool.get().await
+                },
+            )
             .await
             {
                 Ok(result) => result,

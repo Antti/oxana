@@ -106,6 +106,69 @@ async fn claimed_transitions_retry_pool_wait_without_consuming_job_retries() -> 
 }
 
 #[tokio::test]
+async fn claimed_connection_recovers_after_long_pool_wait_timeouts() -> TestResult {
+    dotenvy::from_filename(".env.test").ok();
+    let storage = crate::Storage::builder()
+        .namespace(random_string())
+        .max_pool_size(1)
+        .timeouts(crate::StorageBuilderTimeouts::new(Duration::from_secs(3)))
+        .build_from_redis_url(std::env::var("REDIS_URL")?)?
+        .internal;
+    let held = storage.connection().await?;
+    tokio::time::pause();
+    let connection = storage.claimed_connection("start");
+    tokio::pin!(connection);
+    assert!(connection.as_mut().now_or_never().is_none());
+
+    // The first three-second failure starts a separate six-second retry budget.
+    tokio::time::advance(Duration::from_secs(3)).await;
+    assert!(connection.as_mut().now_or_never().is_none());
+    tokio::time::advance(Duration::from_millis(100)).await;
+    assert!(connection.as_mut().now_or_never().is_none());
+    // A second acquisition can use its full timeout without exhausting the budget.
+    // The former fixed two-second budget would already have returned an error.
+    tokio::time::advance(Duration::from_secs(3)).await;
+    assert!(connection.as_mut().now_or_never().is_none());
+
+    // Resume real time before recycling the connection over the Redis socket.
+    tokio::time::resume();
+    drop(held);
+    let _connection = tokio::time::timeout(Duration::from_secs(2), connection).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn claimed_connection_exhausts_default_and_scaled_pool_wait_budgets() -> TestResult {
+    dotenvy::from_filename(".env.test").ok();
+    for (wait, budget) in [
+        (Duration::from_millis(300), Duration::from_secs(2)),
+        (Duration::from_secs(3), Duration::from_secs(6)),
+    ] {
+        let storage = crate::Storage::builder()
+            .max_pool_size(1)
+            .timeouts(crate::StorageBuilderTimeouts::new(wait))
+            .build_from_redis_url(std::env::var("REDIS_URL")?)?
+            .internal;
+        let _held = storage.connection().await?;
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let result = storage.claimed_connection("start").await;
+        let elapsed = started.elapsed();
+        tokio::time::resume();
+        assert!(matches!(
+            result,
+            Err(OxanaError::DeadpoolRedisPoolError(
+                deadpool_redis::PoolError::Timeout(deadpool_redis::TimeoutType::Wait)
+            ))
+        ));
+        assert!(elapsed >= wait + budget);
+        assert!(elapsed <= wait + budget + Duration::from_millis(10));
+        assert_eq!(storage.pool.status().waiting, 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn claimed_connection_does_not_retry_closed_pool() -> TestResult {
     let pool = redis_pool().await?;
     let storage = StorageInternal::new(pool.clone(), Some(random_string()));
