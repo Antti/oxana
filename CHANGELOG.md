@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-10-28
+
 ### Fixed
 
 - Retry transient Redis connection-acquisition failures for up to two seconds after the first failure before claimed-job start, success, retry, and dead-letter transitions. Keep claims and permits while waiting, without replaying commands whose replies may have been lost. Exhausted retries still initiate shutdown and recovery; recovered jobs may run more than once.
