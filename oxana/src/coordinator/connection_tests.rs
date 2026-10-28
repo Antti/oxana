@@ -31,8 +31,8 @@ impl Worker<ConnectionJob> for ConnectionWorker {
     }
 }
 
-/// Hold new connections before the Redis handshake, producing the same Create
-/// timeout as production without interfering with already established sockets.
+/// Hold new connections before the Redis handshake, producing a create
+/// timeout without interfering with already established sockets.
 struct ConnectionProxy {
     pool: deadpool_redis::Pool,
     paused: Arc<AtomicBool>,
