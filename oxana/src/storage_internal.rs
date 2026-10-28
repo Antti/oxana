@@ -20,6 +20,7 @@ use crate::{
     worker_registry::CronJob,
 };
 
+mod connection;
 mod queue_stats;
 
 #[cfg(test)]
@@ -200,7 +201,7 @@ impl StorageInternal {
     async fn connection_from_pool(
         pool: &deadpool_redis::Pool,
     ) -> Result<deadpool_redis::Connection, OxanaError> {
-        pool.get().await.map_err(OxanaError::DeadpoolRedisPoolError)
+        connection::get(pool).await
     }
 
     async fn scan_keys_w_conn(
@@ -644,7 +645,7 @@ impl StorageInternal {
         loop {
             let error = match result {
                 Ok(envelope) => return Ok(envelope),
-                Err(error) if transient_payload_read_error(&error) => error,
+                Err(error) if transient_redis_error(&error) => error,
                 Err(error) => return Err(error),
             };
             // Equal jitter keeps workers from retrying in lockstep, while a
@@ -2309,7 +2310,7 @@ impl StorageInternal {
     }
 }
 
-fn transient_payload_read_error(error: &OxanaError) -> bool {
+fn transient_redis_error(error: &OxanaError) -> bool {
     let error = match error {
         OxanaError::DeadpoolRedisPoolError(deadpool_redis::PoolError::Timeout(_)) => return true,
         OxanaError::DeadpoolRedisError(error)

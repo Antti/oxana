@@ -18,6 +18,29 @@ async fn fixture() -> TestResult<(StorageInternal, JobEnvelope)> {
     Ok((storage, envelope))
 }
 
+#[tokio::test]
+async fn completion_recovers_from_a_connection_setup_failure_without_losing_the_claim() -> TestResult
+{
+    let (storage, envelope) = fixture().await?;
+    assert_eq!(
+        storage.dequeue(&envelope.queue).await?,
+        Some(envelope.id.clone())
+    );
+    let proxy = RedisProxy::start(vec!["CLIENT".into(), "SETINFO".into()], true).await?;
+    let mut through_proxy = storage.clone();
+    through_proxy.pool = proxy.pool.clone();
+
+    through_proxy.finish_with_success(&envelope).await?;
+
+    assert!(proxy.injected());
+    assert_eq!(proxy.fault_count(), 1);
+    assert_eq!(proxy.claim_count(), 0);
+    assert!(storage.currently_processing_job_ids().await?.is_empty());
+    assert!(storage.get_job(&envelope.id).await?.is_none());
+    assert_eq!(storage.enqueued_count(&envelope.queue).await?, 0);
+    Ok(())
+}
+
 async fn schedule(
     storage: &StorageInternal,
     envelope: &JobEnvelope,
