@@ -36,7 +36,7 @@ Oxana focuses on simplicity and depth over breadth - one backend, done well.
 ## Quick Start
 
 ```bash
-cargo add oxana@2.4.0 --features registry
+cargo add oxana@2.4.1 --features registry
 ```
 
 The `registry` feature (not enabled by default) powers `#[derive(oxana::Registry)]` and `runtime.register::<...>()` used below; without it, register queues and workers explicitly with `runtime.queue::<...>()` and `runtime.worker::<...>()`.
@@ -183,48 +183,6 @@ The component registry automatically discovers and registers all workers and que
 Build it with `Storage::from_env()` or `Storage::builder().build_from_env()`, which read the `REDIS_URL` environment variable.
 Set `REDIS_STATS_URL` to store counters and metrics in a separate Redis instance; when it is not set, stats use `REDIS_URL`.
 Call `storage.runtime(ctx)` to create a typed worker runtime, register queues and workers on that runtime, then call `runtime.run().await`.
-
-Pool acquisition retries are disabled by default. Enable them when short Redis
-stalls should delay an operation instead of immediately returning an error:
-
-```rust
-use std::time::Duration;
-use oxana::{PoolRetryConfig, Storage};
-
-let storage = Storage::builder()
-    .pool_retries(Some(PoolRetryConfig {
-        retry_window: Duration::from_secs(5),
-        initial_backoff: Duration::from_millis(100),
-        max_backoff: Duration::from_secs(1),
-    }))
-    .build_from_env()?;
-```
-
-The window caps the entire checkout, including the first attempt, all subsequent
-attempts, and delays, even when a supplied pool has no timeouts. Backoff doubles
-up to its maximum, with each delay randomly selected between half and all of that
-ceiling. Permanent errors fail immediately;
-only acquiring a connection is retried, never the caller's queue command.
-The policy also applies to supplied pools and statistics pools. Pass `None` to
-disable retries. Pool create/recycle deadlines remain configured by `timeouts`.
-
-Each process publishes its retry window with its heartbeat. Peers automatically
-add that window to their `dead_process_threshold`, even when their own retries
-are disabled. With the defaults, a worker with retries enabled becomes eligible
-for recovery after ten seconds without a heartbeat: the five-second base
-threshold plus its five-second retry window. No threshold adjustment is needed.
-Both `run` and `drain` advertise this allowance, and monitoring uses it too.
-
-The existing `retry_window` and runtime `.dead_process_threshold(...)` settings
-remain configurable. The base threshold must still allow time for the heartbeat
-interval, Redis command latency, and scheduling. The extra allowance also delays
-recovery of jobs from genuinely dead processes; it does not protect against
-outages longer than the combined window.
-
-Upgrade every consumer of the namespace before enabling retries: older binaries
-ignore the advertised allowance. Consumers without retries and old process
-records retain the base threshold. Before rolling back to an older binary,
-disable retries and restart all consumers so no retrying workers remain.
 
 ### Context
 

@@ -291,15 +291,12 @@ where
         self
     }
 
-    /// Sets the base time a process can miss heartbeats before it is considered
-    /// dead and its in-flight jobs become eligible for resurrection. Defaults to 5s.
+    /// Sets how long a process can miss heartbeats before it is considered dead
+    /// and its in-flight jobs become eligible for resurrection. Defaults to 5s.
     ///
     /// Must be comfortably larger than [`Self::heartbeat_interval`], otherwise
     /// live processes are treated as dead and their in-flight jobs are
     /// re-enqueued while still running.
-    /// Each process's advertised pool retry window is added automatically,
-    /// even when this runtime has retries disabled. Older Oxana versions do not
-    /// honor that allowance; upgrade all consumers before enabling retries.
     ///
     /// Note that this also updates the monitoring settings of the underlying
     /// [`Storage`] handle (and all of its clones), so `Storage::stats()` and
@@ -332,7 +329,12 @@ where
     ///
     /// After a transient payload-read failure, preparation retries for up to
     /// five seconds with backoff and jitter, retaining the claim and concurrency
-    /// permit. Other preparation failures, exhausted read retries, and uncertain
+    /// permit. Connection acquisition for job start, acknowledgment, retry and
+    /// dead-letter transitions retries after the first transient failure for
+    /// two seconds or twice the longest configured pool timeout, whichever is
+    /// greater. Unset timeouts do not extend this budget. Transition commands
+    /// that may have been sent are not replayed.
+    /// Other preparation failures, exhausted retries, and uncertain
     /// claims initiate shutdown regardless of this threshold. Redis may already
     /// hold the claim, and a live runtime's heartbeat prevents its recovery.
     /// Shutdown drains active handlers before stopping heartbeats; a peer or
@@ -588,36 +590,6 @@ mod tests {
         Storage::builder()
             .build_from_redis_url("redis://127.0.0.1/0")
             .expect("test storage should build")
-    }
-
-    async fn storage_with_pool_retries() -> testresult::TestResult<Storage> {
-        Ok(Storage::builder()
-            .namespace(crate::test_helper::random_string())
-            .pool_retries(Some(crate::PoolRetryConfig::default()))
-            .build_from_pool(crate::test_helper::redis_pool().await?)?)
-    }
-
-    #[tokio::test]
-    async fn run_accepts_pool_retries_with_the_default_liveness_threshold() -> testresult::TestResult
-    {
-        storage_with_pool_retries()
-            .await?
-            .runtime(())
-            .shutdown_on(async { Ok(()) })
-            .run()
-            .await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn drain_accepts_pool_retries_with_the_default_liveness_threshold()
-    -> testresult::TestResult {
-        storage_with_pool_retries()
-            .await?
-            .runtime(())
-            .drain(QueueOne)
-            .await?;
-        Ok(())
     }
 
     #[test]

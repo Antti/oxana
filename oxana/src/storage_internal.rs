@@ -9,7 +9,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    OxanaError, PoolRetryConfig,
+    OxanaError,
     job_envelope::{JobConflictStrategy, JobEnvelope, JobId},
     metrics::*,
     queue::{QueueRuntimeConfig, QueueState},
@@ -20,7 +20,6 @@ use crate::{
     worker_registry::CronJob,
 };
 
-mod connection;
 mod queue_stats;
 
 #[cfg(test)]
@@ -29,6 +28,9 @@ mod enqueue_tests;
 #[cfg(test)]
 mod transition_tests;
 
+#[cfg(test)]
+mod connection_tests;
+
 use queue_stats::{aggregate_queue_stats, queue_rate_stats};
 
 const JOB_EXPIRE_TIME: i64 = 7 * 24 * 3600; // 7 days
@@ -36,6 +38,7 @@ const SCAN_BATCH_SIZE: usize = 500;
 const STATS_READ_BATCH_SIZE: usize = 500;
 const ENQUEUE_LIST_CHUNK_SIZE: usize = 100;
 const CLAIMED_JOB_READ_RETRY_WINDOW: Duration = Duration::from_secs(5);
+const MIN_CLAIMED_CONNECTION_RETRY_WINDOW: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq, Eq)]
 enum UniqueCronAction {
@@ -71,7 +74,6 @@ fn enqueue_list_chunks(envelopes: &[JobEnvelope]) -> std::slice::Chunks<'_, JobE
 pub(crate) struct StorageInternal {
     pool: deadpool_redis::Pool,
     stats_pool: Option<deadpool_redis::Pool>,
-    pool_retries: Option<PoolRetryConfig>,
     keys: StorageKeys,
     started_at: i64,
     instance_id: String,
@@ -149,26 +151,7 @@ struct QueueStatsInputs {
     queue_counter_totals: HashMap<String, QueueCounterTotals>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ProcessRecord {
-    #[serde(flatten)]
-    process: Process,
-    #[serde(default, skip_serializing_if = "Duration::is_zero")]
-    pool_retry_window: Duration,
-}
-
-struct ProcessStatus {
-    id: String,
-    alive: bool,
-    process: Option<Process>,
-}
-
 impl StorageInternal {
-    pub(crate) fn with_pool_retries(mut self, config: Option<PoolRetryConfig>) -> Self {
-        self.pool_retries = config;
-        self
-    }
-
     pub(crate) fn with_dead_job_limit(mut self, limit: Option<usize>) -> Self {
         self.dead_job_limit = limit;
         self
@@ -195,7 +178,6 @@ impl StorageInternal {
         Self {
             pool,
             stats_pool,
-            pool_retries: None,
             keys,
             started_at: chrono::Utc::now().timestamp(),
             instance_id: uuid::Uuid::new_v4().simple().to_string(),
@@ -212,7 +194,6 @@ impl StorageInternal {
             Some(self.keys.namespace.clone()),
         )
         .with_dead_job_limit(self.dead_job_limit)
-        .with_pool_retries(self.pool_retries)
     }
 
     fn record_redis_success(&self) {
@@ -267,19 +248,78 @@ impl StorageInternal {
     }
 
     pub async fn connection(&self) -> Result<deadpool_redis::Connection, OxanaError> {
-        self.connection_from_pool(&self.pool).await
+        Self::connection_from_pool(&self.pool).await
     }
 
     async fn stats_connection(&self) -> Result<deadpool_redis::Connection, OxanaError> {
         let pool = self.stats_pool.as_ref().unwrap_or(&self.pool);
-        self.connection_from_pool(pool).await
+        Self::connection_from_pool(pool).await
     }
 
     async fn connection_from_pool(
-        &self,
         pool: &deadpool_redis::Pool,
     ) -> Result<deadpool_redis::Connection, OxanaError> {
-        connection::get(pool, self.pool_retries).await
+        pool.get().await.map_err(OxanaError::DeadpoolRedisPoolError)
+    }
+
+    /// Retry acquisition only, before sending a claimed-job transition. Once a
+    /// command is sent its result may be ambiguous, so callers must not replay it.
+    /// The window starts after the first failure and is at least two seconds or
+    /// twice the longest configured pool timeout, whichever is greater. Unset
+    /// timeouts do not extend it. It does not use the shared failure counter,
+    /// which successful heartbeats can reset.
+    async fn claimed_connection(
+        &self,
+        operation: &'static str,
+    ) -> Result<deadpool_redis::Connection, OxanaError> {
+        let mut result = self.pool.get().await;
+        let retry_started = tokio::time::Instant::now();
+        let timeouts = self.pool.timeouts();
+        let retry_window = [timeouts.wait, timeouts.create, timeouts.recycle]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or_default()
+            .saturating_mul(2)
+            .max(MIN_CLAIMED_CONNECTION_RETRY_WINDOW);
+        let mut backoff_ms = 100_u64;
+        loop {
+            let error = match result {
+                Ok(connection) => return Ok(connection),
+                Err(error)
+                    if matches!(&error, deadpool_redis::PoolError::Timeout(_))
+                        || matches!(&error, deadpool_redis::PoolError::Backend(error) if error.is_io_error()) =>
+                {
+                    error
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let half = backoff_ms / 2;
+            let delay_ms = half + uuid::Uuid::new_v4().as_u64_pair().1 % (half + 1);
+            let status = self.pool.status();
+            tracing::warn!(
+                operation,
+                error = %error,
+                pool_size = status.size,
+                pool_available = status.available,
+                pool_waiting = status.waiting,
+                retry_in_ms = delay_ms,
+                "Retrying claimed job Redis connection"
+            );
+            result = match tokio::time::timeout(
+                retry_window.saturating_sub(retry_started.elapsed()),
+                async {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    self.pool.get().await
+                },
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => return Err(error.into()),
+            };
+            backoff_ms = (backoff_ms * 2).min(1000);
+        }
     }
 
     async fn scan_keys_w_conn(
@@ -736,11 +776,11 @@ impl StorageInternal {
         delay_s: u64,
         error: String,
     ) -> Result<(), OxanaError> {
-        let Some(envelope) = self.get_job(&job_id).await? else {
+        let mut redis = self.claimed_connection("retry").await?;
+        let Some(envelope) = self.get_job_w_conn(&mut redis, &job_id).await? else {
             // Dashboard deletion or retention cleanup can remove a running job.
             // Release its claim without touching a replacement payload or retry.
             // Redis errors still propagate so the runtime stops heartbeating.
-            let mut redis = self.connection().await?;
             let _: usize = redis
                 .lrem(self.current_processing_queue(), 1, &job_id)
                 .await?;
@@ -751,7 +791,6 @@ impl StorageInternal {
 
         let now = chrono::Utc::now().timestamp_micros() as u64;
 
-        let mut redis = self.connection().await?;
         // Release ownership only after the payload and retry destination are durable.
         static RETRY: std::sync::LazyLock<redis::Script> =
             std::sync::LazyLock::new(|| redis::Script::new(include_str!("retry_failed.lua")));
@@ -798,7 +837,7 @@ impl StorageInternal {
         loop {
             let error = match result {
                 Ok(envelope) => return Ok(envelope),
-                Err(error) if transient_redis_error(&error) => error,
+                Err(error) if transient_payload_read_error(&error) => error,
                 Err(error) => return Err(error),
             };
             // Equal jitter keeps workers from retrying in lockstep, while a
@@ -882,7 +921,7 @@ impl StorageInternal {
             .map(|envelope| Ok((envelope.id.as_str(), serde_json::to_string(envelope)?)))
             .collect::<Result<Vec<_>, OxanaError>>()?;
 
-        let mut redis = self.connection().await?;
+        let mut redis = self.claimed_connection("start").await?;
         let _: () = redis.hset_multiple(&self.keys.jobs, &items).await?;
         Ok(())
     }
@@ -962,7 +1001,7 @@ impl StorageInternal {
 
     pub async fn kill(&self, envelope: &JobEnvelope, error: String) -> Result<(), OxanaError> {
         let envelope = envelope.clone().with_error(error);
-        let mut redis = self.connection().await?;
+        let mut redis = self.claimed_connection("dead").await?;
         static KILL: std::sync::LazyLock<redis::Script> =
             std::sync::LazyLock::new(|| redis::Script::new(include_str!("finish_dead.lua")));
         let _: () = KILL
@@ -998,7 +1037,7 @@ impl StorageInternal {
         for envelope in envelopes {
             invocation.arg(&envelope.id);
         }
-        let mut redis = self.connection().await?;
+        let mut redis = self.claimed_connection("acknowledge").await?;
         let _: () = invocation.invoke_async(&mut *redis).await?;
         Ok(())
     }
@@ -1874,20 +1913,17 @@ impl StorageInternal {
 
     pub async fn ping(&self) -> Result<(), OxanaError> {
         let mut redis = self.connection().await?;
-        let record = ProcessRecord {
-            process: self.current_process(),
-            pool_retry_window: self
-                .pool_retries
-                .map_or(Duration::ZERO, |config| config.retry_window),
-        };
-        let process_id = record.process.id();
+        let process = self.current_process();
         let _: () = redis::pipe()
-            .atomic()
-            .zadd(&self.keys.processes, &process_id, unix_timestamp_secs_f64())
+            .zadd(
+                &self.keys.processes,
+                process.id(),
+                unix_timestamp_secs_f64(),
+            )
             .hset(
                 &self.keys.processes_data,
-                &process_id,
-                serde_json::to_string(&record)?,
+                process.id(),
+                serde_json::to_string(&process)?,
             )
             .query_async(&mut redis)
             .await?;
@@ -1961,46 +1997,25 @@ impl StorageInternal {
         redis: &mut deadpool_redis::Connection,
         dead_process_threshold: Duration,
     ) -> Result<Vec<Process>, OxanaError> {
-        Ok(self
-            .process_statuses(redis, dead_process_threshold)
-            .await?
-            .into_iter()
-            .filter(|status| status.alive)
-            .filter_map(|status| status.process)
-            .collect())
-    }
-
-    async fn process_statuses(
-        &self,
-        redis: &mut deadpool_redis::Connection,
-        dead_process_threshold: Duration,
-    ) -> Result<Vec<ProcessStatus>, OxanaError> {
-        // Match each heartbeat to its owner's retry allowance in one snapshot.
-        let (heartbeats, mut records): (Vec<(String, f64)>, HashMap<String, String>) =
-            redis::pipe()
-                .atomic()
-                .zrange_withscores(&self.keys.processes, 0, -1)
-                .hgetall(&self.keys.processes_data)
+        let process_ids: Vec<String> = redis
+            .zrangebyscore(
+                &self.keys.processes,
+                unix_timestamp_secs_f64() - dead_process_threshold.as_secs_f64(),
+                unix_timestamp_secs_f64(),
+            )
+            .await?;
+        let mut processes = Vec::new();
+        for ids in process_ids.chunks(STATS_READ_BATCH_SIZE) {
+            let records: Vec<Option<String>> = redis::cmd("HMGET")
+                .arg(&self.keys.processes_data)
+                .arg(ids)
                 .query_async(redis)
                 .await?;
-        let threshold = unix_timestamp_secs_f64() - dead_process_threshold.as_secs_f64();
-        heartbeats
-            .into_iter()
-            .map(|(id, heartbeat)| {
-                let record: Option<ProcessRecord> = records
-                    .remove(&id)
-                    .map(|json| serde_json::from_str(&json))
-                    .transpose()?;
-                let retry_window = record
-                    .as_ref()
-                    .map_or(Duration::ZERO, |record| record.pool_retry_window);
-                Ok(ProcessStatus {
-                    id,
-                    alive: heartbeat >= threshold - retry_window.as_secs_f64(),
-                    process: record.map(|record| record.process),
-                })
-            })
-            .collect()
+            for record in records.into_iter().flatten() {
+                processes.push(serde_json::from_str(&record)?);
+            }
+        }
+        Ok(processes)
     }
 
     pub async fn resurrect_loop(
@@ -2456,17 +2471,21 @@ impl StorageInternal {
         all_processing_queues: &HashSet<String>,
         dead_process_threshold: Duration,
     ) -> Result<Vec<String>, OxanaError> {
-        let statuses = self.process_statuses(redis, dead_process_threshold).await?;
-        let mut active_process_ids = HashSet::with_capacity(statuses.len());
+        let process_ids: Vec<(String, f64)> = (*redis)
+            .zrange_withscores(&self.keys.processes, 0, -1)
+            .await?;
+
+        let threshold = unix_timestamp_secs_f64() - dead_process_threshold.as_secs_f64();
+        let mut active_process_ids = HashSet::with_capacity(process_ids.len());
         let mut dead_process_ids = Vec::new();
 
         // A zset member is returned once, and the loop below only reports ids
         // absent from the set, so no id can be reported twice.
-        for status in statuses {
-            if !status.alive {
-                dead_process_ids.push(status.id.clone());
+        for (process_id, score) in process_ids {
+            if score < threshold {
+                dead_process_ids.push(process_id.clone());
             }
-            active_process_ids.insert(status.id);
+            active_process_ids.insert(process_id);
         }
 
         for processing_queue in all_processing_queues {
@@ -2483,7 +2502,7 @@ impl StorageInternal {
     }
 }
 
-fn transient_redis_error(error: &OxanaError) -> bool {
+fn transient_payload_read_error(error: &OxanaError) -> bool {
     let error = match error {
         OxanaError::DeadpoolRedisPoolError(deadpool_redis::PoolError::Timeout(_)) => return true,
         OxanaError::DeadpoolRedisError(error)

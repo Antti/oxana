@@ -24,6 +24,7 @@ struct FaultState {
     reject_before: bool,
     injected: AtomicBool,
     faults: AtomicUsize,
+    matching_requests: AtomicUsize,
     claims: AtomicUsize,
     request_bytes: AtomicUsize,
     response_bytes: AtomicUsize,
@@ -77,6 +78,10 @@ impl RedisProxy {
         self.fault.faults.load(Ordering::SeqCst)
     }
 
+    pub fn matching_request_count(&self) -> usize {
+        self.fault.matching_requests.load(Ordering::SeqCst)
+    }
+
     pub fn claim_count(&self) -> usize {
         self.fault.claims.load(Ordering::SeqCst)
     }
@@ -121,6 +126,7 @@ impl RedisProxy {
             reject_before,
             injected: AtomicBool::new(false),
             faults: AtomicUsize::new(0),
+            matching_requests: AtomicUsize::new(0),
             claims: AtomicUsize::new(0),
             request_bytes: AtomicUsize::new(0),
             response_bytes: AtomicUsize::new(0),
@@ -182,6 +188,9 @@ async fn forward(
         let command: Vec<String> =
             redis::from_redis_value(redis::parse_redis_value(&request).map_err(io::Error::other)?)
                 .map_err(io::Error::other)?;
+        if command.starts_with(&fault.prefix) {
+            fault.matching_requests.fetch_add(1, Ordering::SeqCst);
+        }
         if fault.reject_before
             && command.starts_with(&fault.prefix)
             && !fault.injected.swap(true, Ordering::SeqCst)
