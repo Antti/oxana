@@ -291,16 +291,15 @@ where
         self
     }
 
-    /// Sets how long a process can miss heartbeats before it is considered dead
-    /// and its in-flight jobs become eligible for resurrection. Defaults to 5s.
+    /// Sets the base time a process can miss heartbeats before it is considered
+    /// dead and its in-flight jobs become eligible for resurrection. Defaults to 5s.
     ///
     /// Must be comfortably larger than [`Self::heartbeat_interval`], otherwise
     /// live processes are treated as dead and their in-flight jobs are
     /// re-enqueued while still running.
-    /// With pool retries enabled, `run` and `drain` reject thresholds that do
-    /// not exceed the retry window plus the heartbeat interval. Allow additional
-    /// time for the heartbeat command and scheduling. Set the same threshold on
-    /// every consumer of the namespace before enabling retries on any of them.
+    /// Each process's advertised pool retry window is added automatically,
+    /// even when this runtime has retries disabled. Older Oxana versions do not
+    /// honor that allowance; upgrade all consumers before enabling retries.
     ///
     /// Note that this also updates the monitoring settings of the underlying
     /// [`Storage`] handle (and all of its clones), so `Storage::stats()` and
@@ -434,7 +433,6 @@ where
 
     /// Runs the Oxana worker system.
     pub async fn run(self) -> Result<RunStats, OxanaError> {
-        self.validate_pool_retry_liveness()?;
         let mut missing_queues: Vec<String> = self
             .settings
             .queue_allowlist
@@ -477,7 +475,6 @@ where
 
     /// Drains a queue of jobs using this runtime's registrations.
     pub async fn drain(&self, queue: impl Queue) -> Result<DrainStats, OxanaError> {
-        self.validate_pool_retry_liveness()?;
         drainer::drain(
             &self.storage,
             &self.config,
@@ -486,13 +483,6 @@ where
             queue,
         )
         .await
-    }
-
-    fn validate_pool_retry_liveness(&self) -> Result<(), OxanaError> {
-        self.storage.internal.validate_pool_retry_liveness(
-            self.settings.heartbeat_interval,
-            self.settings.dead_process_threshold,
-        )
     }
 
     #[cfg(test)]
@@ -600,62 +590,34 @@ mod tests {
             .expect("test storage should build")
     }
 
-    fn storage_with_pool_retries() -> Storage {
-        Storage::builder()
+    async fn storage_with_pool_retries() -> testresult::TestResult<Storage> {
+        Ok(Storage::builder()
+            .namespace(crate::test_helper::random_string())
             .pool_retries(Some(crate::PoolRetryConfig::default()))
-            .build_from_redis_url("redis://127.0.0.1:1/0")
-            .expect("test storage should build")
+            .build_from_pool(crate::test_helper::redis_pool().await?)?)
     }
 
     #[tokio::test]
-    async fn run_rejects_pool_retries_that_can_outlive_the_process() {
-        let result = storage_with_pool_retries()
+    async fn run_accepts_pool_retries_with_the_default_liveness_threshold() -> testresult::TestResult
+    {
+        storage_with_pool_retries()
+            .await?
             .runtime(())
             .shutdown_on(async { Ok(()) })
             .run()
-            .await;
-        assert!(matches!(result, Err(OxanaError::ConfigError(message))
-            if message.contains("dead_process_threshold") && message.contains("every consumer")));
+            .await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn drain_rejects_pool_retries_that_can_outlive_the_process() {
-        let result = storage_with_pool_retries()
+    async fn drain_accepts_pool_retries_with_the_default_liveness_threshold()
+    -> testresult::TestResult {
+        storage_with_pool_retries()
+            .await?
             .runtime(())
             .drain(QueueOne)
-            .await;
-        assert!(matches!(result, Err(OxanaError::ConfigError(message))
-            if message.contains("dead_process_threshold")));
-    }
-
-    #[test]
-    fn pool_retry_liveness_requires_room_for_the_heartbeat() {
-        let runtime = || storage_with_pool_retries().runtime(());
-        assert!(
-            runtime()
-                .dead_process_threshold(Duration::from_millis(5500))
-                .validate_pool_retry_liveness()
-                .is_err()
-        );
-        assert!(
-            runtime()
-                .dead_process_threshold(Duration::from_secs(10))
-                .validate_pool_retry_liveness()
-                .is_ok()
-        );
-        assert!(
-            runtime()
-                .heartbeat_interval(Duration::MAX)
-                .dead_process_threshold(Duration::MAX)
-                .validate_pool_retry_liveness()
-                .is_err()
-        );
-        assert!(
-            test_storage()
-                .runtime(())
-                .validate_pool_retry_liveness()
-                .is_ok()
-        );
+            .await?;
+        Ok(())
     }
 
     #[test]

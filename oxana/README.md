@@ -208,19 +208,23 @@ only acquiring a connection is retried, never the caller's queue command.
 The policy also applies to supplied pools and statistics pools. Pass `None` to
 disable retries. Pool create/recycle deadlines remain configured by `timeouts`.
 
-Before enabling retries, configure a larger `dead_process_threshold` on **every
-consumer of the namespace**, including consumers with retries disabled. Otherwise
-a peer can requeue a job while its worker is still waiting to send a heartbeat.
-Both `run` and `drain` reject a threshold that does not exceed the retry window
-plus `heartbeat_interval`. With the five-second retry window and default 500 ms
-heartbeat interval, a ten-second threshold leaves 4.5 seconds for the heartbeat
-command and scheduling; choose a larger margin if needed for your Redis latency.
-Set it with `.dead_process_threshold(Duration::from_secs(10))` on each runtime.
-This is not protection against outages longer than the liveness threshold.
+Each process publishes its retry window with its heartbeat. Peers automatically
+add that window to their `dead_process_threshold`, even when their own retries
+are disabled. With the defaults, a worker with retries enabled becomes eligible
+for recovery after ten seconds without a heartbeat: the five-second base
+threshold plus its five-second retry window. No threshold adjustment is needed.
+Both `run` and `drain` advertise this allowance, and monitoring uses it too.
 
-Roll out the larger threshold to all consumers first, then enable retries. To
-roll back, disable retries everywhere before reducing the threshold. A longer
-threshold also delays recovery of jobs from genuinely dead processes.
+The existing `retry_window` and runtime `.dead_process_threshold(...)` settings
+remain configurable. The base threshold must still allow time for the heartbeat
+interval, Redis command latency, and scheduling. The extra allowance also delays
+recovery of jobs from genuinely dead processes; it does not protect against
+outages longer than the combined window.
+
+Upgrade every consumer of the namespace before enabling retries: older binaries
+ignore the advertised allowance. Consumers without retries and old process
+records retain the base threshold. Before rolling back to an older binary,
+disable retries and restart all consumers so no retrying workers remain.
 
 ### Context
 

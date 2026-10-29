@@ -10,8 +10,8 @@ use crate::OxanaError;
 pub struct PoolRetryConfig {
     /// Maximum time for the entire checkout, including its first attempt,
     /// subsequent attempts, and backoff. The pool's own timeouts still apply.
-    /// Runtime liveness thresholds must exceed this window plus the heartbeat
-    /// interval; configure the same threshold on every consumer of a namespace.
+    /// Published with this process's heartbeat so peers add it to their base
+    /// liveness threshold, including peers with retries disabled.
     pub retry_window: Duration,
     /// Initial backoff ceiling, at least one millisecond. Each delay is randomly
     /// selected between half and all of its ceiling.

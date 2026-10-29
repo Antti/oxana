@@ -149,28 +149,24 @@ struct QueueStatsInputs {
     queue_counter_totals: HashMap<String, QueueCounterTotals>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProcessRecord {
+    #[serde(flatten)]
+    process: Process,
+    #[serde(default, skip_serializing_if = "Duration::is_zero")]
+    pool_retry_window: Duration,
+}
+
+struct ProcessStatus {
+    id: String,
+    alive: bool,
+    process: Option<Process>,
+}
+
 impl StorageInternal {
     pub(crate) fn with_pool_retries(mut self, config: Option<PoolRetryConfig>) -> Self {
         self.pool_retries = config;
         self
-    }
-
-    pub(crate) fn validate_pool_retry_liveness(
-        &self,
-        heartbeat_interval: Duration,
-        dead_process_threshold: Duration,
-    ) -> Result<(), OxanaError> {
-        if let Some(config) = self.pool_retries
-            && heartbeat_interval
-                .checked_add(config.retry_window)
-                .is_none_or(|gap| dead_process_threshold <= gap)
-        {
-            return Err(OxanaError::ConfigError(format!(
-                "dead_process_threshold ({dead_process_threshold:?}) must exceed heartbeat_interval ({heartbeat_interval:?}) plus pool retry_window ({:?}); allow additional time for the heartbeat command and scheduling, and configure the same threshold on every consumer before enabling pool retries",
-                config.retry_window,
-            )));
-        }
-        Ok(())
     }
 
     pub(crate) fn with_dead_job_limit(mut self, limit: Option<usize>) -> Self {
@@ -1878,17 +1874,20 @@ impl StorageInternal {
 
     pub async fn ping(&self) -> Result<(), OxanaError> {
         let mut redis = self.connection().await?;
-        let process = self.current_process();
+        let record = ProcessRecord {
+            process: self.current_process(),
+            pool_retry_window: self
+                .pool_retries
+                .map_or(Duration::ZERO, |config| config.retry_window),
+        };
+        let process_id = record.process.id();
         let _: () = redis::pipe()
-            .zadd(
-                &self.keys.processes,
-                process.id(),
-                unix_timestamp_secs_f64(),
-            )
+            .atomic()
+            .zadd(&self.keys.processes, &process_id, unix_timestamp_secs_f64())
             .hset(
                 &self.keys.processes_data,
-                process.id(),
-                serde_json::to_string(&process)?,
+                &process_id,
+                serde_json::to_string(&record)?,
             )
             .query_async(&mut redis)
             .await?;
@@ -1962,25 +1961,46 @@ impl StorageInternal {
         redis: &mut deadpool_redis::Connection,
         dead_process_threshold: Duration,
     ) -> Result<Vec<Process>, OxanaError> {
-        let process_ids: Vec<String> = redis
-            .zrangebyscore(
-                &self.keys.processes,
-                unix_timestamp_secs_f64() - dead_process_threshold.as_secs_f64(),
-                unix_timestamp_secs_f64(),
-            )
-            .await?;
-        let mut processes = Vec::new();
-        for ids in process_ids.chunks(STATS_READ_BATCH_SIZE) {
-            let records: Vec<Option<String>> = redis::cmd("HMGET")
-                .arg(&self.keys.processes_data)
-                .arg(ids)
+        Ok(self
+            .process_statuses(redis, dead_process_threshold)
+            .await?
+            .into_iter()
+            .filter(|status| status.alive)
+            .filter_map(|status| status.process)
+            .collect())
+    }
+
+    async fn process_statuses(
+        &self,
+        redis: &mut deadpool_redis::Connection,
+        dead_process_threshold: Duration,
+    ) -> Result<Vec<ProcessStatus>, OxanaError> {
+        // Match each heartbeat to its owner's retry allowance in one snapshot.
+        let (heartbeats, mut records): (Vec<(String, f64)>, HashMap<String, String>) =
+            redis::pipe()
+                .atomic()
+                .zrange_withscores(&self.keys.processes, 0, -1)
+                .hgetall(&self.keys.processes_data)
                 .query_async(redis)
                 .await?;
-            for record in records.into_iter().flatten() {
-                processes.push(serde_json::from_str(&record)?);
-            }
-        }
-        Ok(processes)
+        let threshold = unix_timestamp_secs_f64() - dead_process_threshold.as_secs_f64();
+        heartbeats
+            .into_iter()
+            .map(|(id, heartbeat)| {
+                let record: Option<ProcessRecord> = records
+                    .remove(&id)
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()?;
+                let retry_window = record
+                    .as_ref()
+                    .map_or(Duration::ZERO, |record| record.pool_retry_window);
+                Ok(ProcessStatus {
+                    id,
+                    alive: heartbeat >= threshold - retry_window.as_secs_f64(),
+                    process: record.map(|record| record.process),
+                })
+            })
+            .collect()
     }
 
     pub async fn resurrect_loop(
@@ -2436,21 +2456,17 @@ impl StorageInternal {
         all_processing_queues: &HashSet<String>,
         dead_process_threshold: Duration,
     ) -> Result<Vec<String>, OxanaError> {
-        let process_ids: Vec<(String, f64)> = (*redis)
-            .zrange_withscores(&self.keys.processes, 0, -1)
-            .await?;
-
-        let threshold = unix_timestamp_secs_f64() - dead_process_threshold.as_secs_f64();
-        let mut active_process_ids = HashSet::with_capacity(process_ids.len());
+        let statuses = self.process_statuses(redis, dead_process_threshold).await?;
+        let mut active_process_ids = HashSet::with_capacity(statuses.len());
         let mut dead_process_ids = Vec::new();
 
         // A zset member is returned once, and the loop below only reports ids
         // absent from the set, so no id can be reported twice.
-        for (process_id, score) in process_ids {
-            if score < threshold {
-                dead_process_ids.push(process_id.clone());
+        for status in statuses {
+            if !status.alive {
+                dead_process_ids.push(status.id.clone());
             }
-            active_process_ids.insert(process_id);
+            active_process_ids.insert(status.id);
         }
 
         for processing_queue in all_processing_queues {

@@ -99,9 +99,11 @@ impl StorageBuilder {
     /// Applies to primary and statistics pools, including supplied pools.
     ///
     /// The retry window bounds the entire checkout, including the first attempt
-    /// and backoff. Permanent errors fail immediately. Worker runtimes require a
-    /// liveness threshold larger than the window plus their heartbeat interval.
-    /// Invalid durations are rejected when building the storage.
+    /// and backoff. Permanent errors fail immediately. Peers automatically add
+    /// each process's retry window to their base liveness threshold, even with
+    /// retries disabled. Upgrade all consumers before enabling retries because
+    /// older Oxana versions ignore this allowance. Invalid durations are
+    /// rejected when building the storage.
     pub fn pool_retries(mut self, config: Option<PoolRetryConfig>) -> Self {
         self.pool_retries = config;
         self

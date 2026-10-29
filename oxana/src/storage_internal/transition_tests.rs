@@ -41,7 +41,7 @@ async fn completion_recovers_from_a_connection_setup_failure_without_losing_the_
 async fn peer_preserves_a_live_claim_while_its_heartbeat_retries() -> TestResult {
     let (storage, envelope) = fixture().await?;
     let peer = storage.for_new_process();
-    let threshold = Duration::from_secs(10);
+    let threshold = Duration::from_secs(5);
     let pool =
         deadpool_redis::Pool::builder(deadpool_redis::Manager::new(std::env::var("REDIS_URL")?)?)
             .max_size(1)
@@ -58,7 +58,6 @@ async fn peer_preserves_a_live_claim_while_its_heartbeat_retries() -> TestResult
         .clone()
         .with_pool_retries(Some(PoolRetryConfig::default()));
     worker.pool = pool.clone();
-    worker.validate_pool_retry_liveness(Duration::from_millis(500), threshold)?;
     worker.ping().await?;
     peer.ping().await?;
     assert_eq!(
@@ -73,7 +72,7 @@ async fn peer_preserves_a_live_claim_while_its_heartbeat_retries() -> TestResult
     assert!(!heartbeat.is_finished());
 
     // Model a delayed heartbeat without waiting on wall time.
-    // The old five-second threshold would let the peer steal this live claim.
+    // The peer must include the owner's retry window despite having retries disabled.
     let mut redis = storage.connection().await?;
     let _: () = redis
         .zadd(
@@ -94,6 +93,129 @@ async fn peer_preserves_a_live_claim_while_its_heartbeat_retries() -> TestResult
     worker.finish_with_success(&envelope).await?;
     assert!(storage.currently_processing_job_ids().await?.is_empty());
     assert!(peer.get_job(&envelope.id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn peers_recover_claims_after_the_owners_retry_window_and_base_threshold_expire() -> TestResult
+{
+    let (storage, envelope) = fixture().await?;
+    let worker = storage.with_pool_retries(Some(PoolRetryConfig {
+        retry_window: Duration::from_millis(8500),
+        ..Default::default()
+    }));
+    let peer = worker
+        .for_new_process()
+        .with_pool_retries(Some(PoolRetryConfig {
+            retry_window: Duration::from_secs(20),
+            ..Default::default()
+        }));
+    let threshold = Duration::from_secs(3);
+    worker.ping().await?;
+    worker.dequeue(&envelope.queue).await?;
+    let mut redis = peer.connection().await?;
+
+    // A legacy Process reader can still display the extended heartbeat record.
+    let json: String = redis
+        .hget(&worker.keys.processes_data, worker.current_process().id())
+        .await?;
+    let process: Process = serde_json::from_str(&json)?;
+    assert_eq!(process.id(), worker.current_process().id());
+
+    let _: () = redis
+        .zadd(
+            &worker.keys.processes,
+            process.id(),
+            unix_timestamp_secs_f64() - 10.5,
+        )
+        .await?;
+    assert_eq!(peer.processes(threshold).await?.len(), 1);
+    peer.resurrect(threshold).await?;
+    assert_eq!(peer.enqueued_count(&envelope.queue).await?, 0);
+
+    // The owner's 8.5s window extends the 3s base; the peer's 20s window does not.
+    let _: () = redis
+        .zadd(
+            &worker.keys.processes,
+            process.id(),
+            unix_timestamp_secs_f64() - 12.5,
+        )
+        .await?;
+    assert!(peer.processes(threshold).await?.is_empty());
+    peer.resurrect(threshold).await?;
+    assert_eq!(peer.enqueued_count(&envelope.queue).await?, 1);
+    assert!(worker.currently_processing_job_ids().await?.is_empty());
+    assert!(peer.get_job(&envelope.id).await?.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_process_records_use_the_base_threshold_even_when_the_peer_retries() -> TestResult {
+    let (worker, envelope) = fixture().await?;
+    let peer = worker
+        .for_new_process()
+        .with_pool_retries(Some(PoolRetryConfig::default()));
+    let process = worker.current_process();
+    let mut redis = worker.connection().await?;
+    let _: () = redis::pipe()
+        .hset(
+            &worker.keys.processes_data,
+            process.id(),
+            serde_json::to_string(&process)?,
+        )
+        .zadd(
+            &worker.keys.processes,
+            process.id(),
+            unix_timestamp_secs_f64() - 6.0,
+        )
+        .query_async(&mut redis)
+        .await?;
+    worker.dequeue(&envelope.queue).await?;
+
+    let threshold = Duration::from_secs(5);
+    assert!(peer.processes(threshold).await?.is_empty());
+    peer.resurrect(threshold).await?;
+    assert_eq!(peer.enqueued_count(&envelope.queue).await?, 1);
+    assert!(worker.currently_processing_job_ids().await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_heartbeat_without_metadata_keeps_its_claim_until_the_base_threshold_expires()
+-> TestResult {
+    let (worker, envelope) = fixture().await?;
+    let peer = worker
+        .for_new_process()
+        .with_pool_retries(Some(PoolRetryConfig::default()));
+    worker.dequeue(&envelope.queue).await?;
+    let mut redis = worker.connection().await?;
+    let process_id = worker.current_process().id();
+    let _: () = redis
+        .zadd(
+            &worker.keys.processes,
+            &process_id,
+            unix_timestamp_secs_f64(),
+        )
+        .await?;
+
+    let threshold = Duration::from_secs(5);
+    peer.resurrect(threshold).await?;
+    assert_eq!(peer.enqueued_count(&envelope.queue).await?, 0);
+    assert_eq!(
+        worker.currently_processing_job_ids().await?,
+        vec![envelope.id.clone()]
+    );
+
+    let _: () = redis
+        .zadd(
+            &worker.keys.processes,
+            &process_id,
+            unix_timestamp_secs_f64() - 6.0,
+        )
+        .await?;
+    peer.resurrect(threshold).await?;
+    assert_eq!(peer.enqueued_count(&envelope.queue).await?, 1);
+    assert!(worker.currently_processing_job_ids().await?.is_empty());
     Ok(())
 }
 
