@@ -98,8 +98,9 @@ impl StorageBuilder {
     /// Disabled by default; `None` disables a previously configured policy.
     /// Applies to primary and statistics pools, including supplied pools.
     ///
-    /// The retry window starts after the first failed acquisition and bounds
-    /// both backoff and subsequent attempts. Permanent errors fail immediately.
+    /// The retry window bounds the entire checkout, including the first attempt
+    /// and backoff. Permanent errors fail immediately. Worker runtimes require a
+    /// liveness threshold larger than the window plus their heartbeat interval.
     /// Invalid durations are rejected when building the storage.
     pub fn pool_retries(mut self, config: Option<PoolRetryConfig>) -> Self {
         self.pool_retries = config;

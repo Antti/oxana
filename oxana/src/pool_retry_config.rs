@@ -8,8 +8,10 @@ use crate::OxanaError;
 /// Queue commands are never replayed by this policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PoolRetryConfig {
-    /// Time available after the first failed acquisition, including backoff and
-    /// subsequent acquisitions. The first attempt uses the pool's own timeouts.
+    /// Maximum time for the entire checkout, including its first attempt,
+    /// subsequent attempts, and backoff. The pool's own timeouts still apply.
+    /// Runtime liveness thresholds must exceed this window plus the heartbeat
+    /// interval; configure the same threshold on every consumer of a namespace.
     pub retry_window: Duration,
     /// Initial backoff ceiling, at least one millisecond. Each delay is randomly
     /// selected between half and all of its ceiling.

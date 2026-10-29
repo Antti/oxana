@@ -155,6 +155,24 @@ impl StorageInternal {
         self
     }
 
+    pub(crate) fn validate_pool_retry_liveness(
+        &self,
+        heartbeat_interval: Duration,
+        dead_process_threshold: Duration,
+    ) -> Result<(), OxanaError> {
+        if let Some(config) = self.pool_retries
+            && heartbeat_interval
+                .checked_add(config.retry_window)
+                .is_none_or(|gap| dead_process_threshold <= gap)
+        {
+            return Err(OxanaError::ConfigError(format!(
+                "dead_process_threshold ({dead_process_threshold:?}) must exceed heartbeat_interval ({heartbeat_interval:?}) plus pool retry_window ({:?}); allow additional time for the heartbeat command and scheduling, and configure the same threshold on every consumer before enabling pool retries",
+                config.retry_window,
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn with_dead_job_limit(mut self, limit: Option<usize>) -> Self {
         self.dead_job_limit = limit;
         self

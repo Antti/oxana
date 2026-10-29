@@ -37,6 +37,66 @@ async fn completion_recovers_from_a_connection_setup_failure_without_losing_the_
     Ok(())
 }
 
+#[tokio::test]
+async fn peer_preserves_a_live_claim_while_its_heartbeat_retries() -> TestResult {
+    let (storage, envelope) = fixture().await?;
+    let peer = storage.for_new_process();
+    let threshold = Duration::from_secs(10);
+    let pool =
+        deadpool_redis::Pool::builder(deadpool_redis::Manager::new(std::env::var("REDIS_URL")?)?)
+            .max_size(1)
+            .timeouts(
+                crate::StorageBuilderTimeouts {
+                    wait: Some(Duration::ZERO),
+                    ..Default::default()
+                }
+                .into(),
+            )
+            .runtime(deadpool_redis::Runtime::Tokio1)
+            .build()?;
+    let mut worker = storage
+        .clone()
+        .with_pool_retries(Some(PoolRetryConfig::default()));
+    worker.pool = pool.clone();
+    worker.validate_pool_retry_liveness(Duration::from_millis(500), threshold)?;
+    worker.ping().await?;
+    peer.ping().await?;
+    assert_eq!(
+        worker.dequeue(&envelope.queue).await?,
+        Some(envelope.id.clone())
+    );
+
+    let held = pool.get().await?;
+    let heartbeat_worker = worker.clone();
+    let heartbeat = tokio::spawn(async move { heartbeat_worker.ping().await });
+    tokio::task::yield_now().await;
+    assert!(!heartbeat.is_finished());
+
+    // Model a delayed heartbeat without waiting on wall time.
+    // The old five-second threshold would let the peer steal this live claim.
+    let mut redis = storage.connection().await?;
+    let _: () = redis
+        .zadd(
+            &storage.keys.processes,
+            worker.current_process().id(),
+            unix_timestamp_secs_f64() - 5.05,
+        )
+        .await?;
+    peer.resurrect(threshold).await?;
+    assert_eq!(peer.enqueued_count(&envelope.queue).await?, 0);
+    assert_eq!(
+        storage.currently_processing_job_ids().await?,
+        vec![envelope.id.clone()]
+    );
+
+    drop(held);
+    heartbeat.await??;
+    worker.finish_with_success(&envelope).await?;
+    assert!(storage.currently_processing_job_ids().await?.is_empty());
+    assert!(peer.get_job(&envelope.id).await?.is_none());
+    Ok(())
+}
+
 async fn schedule(
     storage: &StorageInternal,
     envelope: &JobEnvelope,

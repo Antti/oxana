@@ -200,12 +200,27 @@ let storage = Storage::builder()
     .build_from_env()?;
 ```
 
-The window starts after the first failed checkout and includes all subsequent
-attempts and delays. Backoff doubles up to its maximum, with each delay randomly
-selected between half and all of that ceiling. Permanent errors fail immediately;
+The window caps the entire checkout, including the first attempt, all subsequent
+attempts, and delays, even when a supplied pool has no timeouts. Backoff doubles
+up to its maximum, with each delay randomly selected between half and all of that
+ceiling. Permanent errors fail immediately;
 only acquiring a connection is retried, never the caller's queue command.
 The policy also applies to supplied pools and statistics pools. Pass `None` to
 disable retries. Pool create/recycle deadlines remain configured by `timeouts`.
+
+Before enabling retries, configure a larger `dead_process_threshold` on **every
+consumer of the namespace**, including consumers with retries disabled. Otherwise
+a peer can requeue a job while its worker is still waiting to send a heartbeat.
+Both `run` and `drain` reject a threshold that does not exceed the retry window
+plus `heartbeat_interval`. With the five-second retry window and default 500 ms
+heartbeat interval, a ten-second threshold leaves 4.5 seconds for the heartbeat
+command and scheduling; choose a larger margin if needed for your Redis latency.
+Set it with `.dead_process_threshold(Duration::from_secs(10))` on each runtime.
+This is not protection against outages longer than the liveness threshold.
+
+Roll out the larger threshold to all consumers first, then enable retries. To
+roll back, disable retries everywhere before reducing the threshold. A longer
+threshold also delays recovery of jobs from genuinely dead processes.
 
 ### Context
 

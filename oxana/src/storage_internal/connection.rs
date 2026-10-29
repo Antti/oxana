@@ -21,13 +21,19 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, OxanaError>>,
 {
-    let mut result = acquire().await;
     let Some(config) = config else {
-        return result;
+        return acquire().await;
     };
     let deadline = tokio::time::Instant::now()
         .checked_add(config.retry_window)
         .ok_or_else(|| OxanaError::ConfigError("pool retry deadline is out of range".into()))?;
+    let mut result = tokio::time::timeout_at(deadline, acquire())
+        .await
+        .map_err(|elapsed| {
+            OxanaError::DeadpoolRedisError(
+                std::io::Error::new(std::io::ErrorKind::TimedOut, elapsed).into(),
+            )
+        })?;
     let mut backoff = config.initial_backoff;
     loop {
         let error = match result {
@@ -78,7 +84,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn custom_window_and_backoff_bound_retries_after_the_initial_attempt() {
+    async fn custom_window_includes_the_initial_attempt_and_backoff() {
         let config = PoolRetryConfig {
             retry_window: Duration::from_millis(2300),
             initial_backoff: Duration::from_millis(400),
@@ -91,20 +97,17 @@ mod tests {
             let first = attempts.borrow().len() == 1;
             async move {
                 if first {
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
                 Err(timeout(TimeoutType::Wait))
             }
         })
         .await;
         assert!(result.is_err());
-        assert_eq!(
-            start.elapsed(),
-            Duration::from_secs(3) + config.retry_window
-        );
+        assert_eq!(start.elapsed(), config.retry_window);
         let attempts = attempts.into_inner();
-        assert!(attempts.len() > 3);
-        let mut previous = start + Duration::from_secs(3);
+        assert!(attempts.len() >= 3);
+        let mut previous = start + Duration::from_secs(1);
         let mut ceiling = config.initial_backoff;
         for attempt in attempts.into_iter().skip(1) {
             let delay = attempt - previous;
@@ -271,6 +274,18 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert_eq!(calls.get(), 2);
+        assert_eq!(start.elapsed(), PoolRetryConfig::default().retry_window);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_budget_bounds_an_unresponsive_first_checkout() {
+        let start = tokio::time::Instant::now();
+        let result = retry_pool_acquisition::<(), _, _>(
+            Some(PoolRetryConfig::default()),
+            std::future::pending,
+        )
+        .await;
+        assert!(matches!(result, Err(OxanaError::DeadpoolRedisError(error)) if error.is_timeout()));
         assert_eq!(start.elapsed(), PoolRetryConfig::default().retry_window);
     }
 }
