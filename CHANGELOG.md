@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - Bound claimed-job connection acquisition from the first attempt, including pools with unset timeouts. The configured or derived retry window now limits the entire checkout rather than starting after the first failure.
+- Apply configured Redis connection and response timeouts during setup instead of after connection creation, so Redis's default 500 ms response deadline cannot override a longer pool creation timeout. Requires deadpool-redis 0.23.1 or later.
 
 ## [2.4.1] - 2026-10-28
 
