@@ -233,6 +233,53 @@ async fn custom_retry_window_limits_the_first_acquisition() -> TestResult {
 }
 
 #[tokio::test]
+async fn claimed_connection_uses_configured_exponential_backoff_with_jitter() -> TestResult {
+    dotenvy::from_filename(".env.test").ok();
+    let wait = Duration::from_millis(20);
+    let storage = crate::Storage::builder()
+        .max_pool_size(1)
+        .timeouts(crate::StorageBuilderTimeouts::new(wait))
+        .claimed_connection_retries(Some(PoolRetryConfig {
+            retry_window: Some(Duration::from_secs(30)),
+            initial_backoff: Duration::from_secs(2),
+            max_backoff: Duration::from_secs(5),
+        }))
+        .build_from_redis_url(std::env::var("REDIS_URL")?)?
+        .internal;
+    let _held = storage.connection().await?;
+    tokio::time::pause();
+    let connection = storage.claimed_connection("start");
+    tokio::pin!(connection);
+    assert!(connection.as_mut().now_or_never().is_none());
+    assert_eq!(storage.pool.status().waiting, 1);
+
+    // A held slot makes each attempt visible as a pool waiter. Between attempts,
+    // jitter must keep the delay within half to all of the exponential ceiling.
+    let tick = Duration::from_millis(1);
+    for (retry, ceiling) in [2, 4, 5, 5].into_iter().enumerate() {
+        let ceiling = Duration::from_secs(ceiling);
+        tokio::time::advance(wait + tick).await;
+        assert!(connection.as_mut().now_or_never().is_none());
+        assert_eq!(storage.pool.status().waiting, 0);
+        let started = tokio::time::Instant::now();
+
+        while storage.pool.status().waiting == 0 {
+            tokio::time::advance(tick).await;
+            assert!(connection.as_mut().now_or_never().is_none());
+            assert!(
+                started.elapsed() <= ceiling + tick,
+                "retry {retry} exceeded its backoff ceiling"
+            );
+        }
+        assert!(
+            started.elapsed() >= ceiling / 2,
+            "retry {retry} started before its minimum jittered delay"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn custom_retries_only_extend_claimed_connections_and_follow_new_processes() -> TestResult {
     dotenvy::from_filename(".env.test").ok();
     let storage = crate::Storage::builder()
